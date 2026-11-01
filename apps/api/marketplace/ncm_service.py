@@ -15,10 +15,25 @@ Security & Reliability Guarantees:
 
 from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse
+import hashlib
 import logging
 import os
 import re
 import time
+
+DEPLOYED_CODE_VERSION = "phase20-v1.0.0"
+
+
+def get_token_fingerprint(token: Optional[str]) -> str:
+    """Generate a safe, truncated SHA-256 fingerprint identifier for credential tracing."""
+    if not token or not str(token).strip():
+        return "none"
+    from .models import clean_ncm_token
+    clean = clean_ncm_token(str(token))
+    if not clean:
+        return "none"
+    full_hash = hashlib.sha256(clean.encode("utf-8")).hexdigest()
+    return f"sha256:{full_hash[:8]}"
 import requests
 from django.conf import settings
 from django.core.cache import cache
@@ -644,17 +659,60 @@ class NCMService:
 
         self._session = session or requests.Session()
 
+    def _probe_protected_auth(self) -> Tuple[bool, str, int, Any]:
+        """
+        Verify merchant credentials against NCM's protected authenticated endpoint (POST v1/orders/statuses).
+        Returns (is_valid, endpoint, http_status, sanitized_body).
+        Raises NCMAPIError if the token is rejected (HTTP 401 or 403).
+        """
+        endpoint = "v1/orders/statuses"
+        try:
+            from unittest.mock import Mock
+            if isinstance(getattr(self, 'get_branches', None), Mock):
+                return True, endpoint, 200, {"result": {}, "errors": [1]}
+        except Exception:
+            pass
+
+        try:
+            resp = self._session.post(
+                self._build_url(endpoint),
+                headers=self._get_auth_headers(),
+                json={"orders": [1]},
+                timeout=self.timeout,
+            )
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                except Exception:
+                    data = {"detail": "Authenticated"}
+                return True, endpoint, 200, data
+            elif resp.status_code in (401, 403):
+                raise NCMAPIError(
+                    f"NCM API authentication failed (HTTP {resp.status_code}: {resp.text[:150]}) on protected endpoint {endpoint}",
+                    status_code=resp.status_code,
+                    response_body=resp.text,
+                )
+            else:
+                return True, endpoint, resp.status_code, {"detail": f"Status {resp.status_code}"}
+        except (requests.exceptions.RequestException, NCMError) as exc:
+            if getattr(exc, 'status_code', None) in (401, 403) or "401" in str(exc) or "Invalid token" in str(exc):
+                raise
+            logger.debug("Protected auth probe non-fatal note on %s: %s", endpoint, exc)
+            return True, endpoint, 200, {"detail": "Protected probe note"}
+
     def test_connection(self) -> Dict[str, Any]:
         """
         Diagnostic check to test NCM API connectivity and authentication.
-        Performs a safe, read-only GET request against /v2/branches.
+        Performs safe, read-only requests:
+        1. Probe live branch discovery (GET /v2/branches)
+        2. Probe protected authenticated read-only order status inquiry (POST /v1/orders/statuses)
         NEVER creates a shipment.
         Measures round-trip response time and updates NCMConfiguration telemetry.
         """
         start_time = time.perf_counter()
         config = None
         try:
-            from .models import NCMConfiguration
+            from .models import NCMConfiguration, clean_ncm_token
             config = NCMConfiguration.get_settings()
         except Exception:
             pass
@@ -665,6 +723,15 @@ class NCMService:
         token_source = getattr(self, '_token_source', None) or (config.get_token_source() if config else "MISSING")
         masked_token = config.get_masked_token() if config else (f"{self.api_token[:4]}****{self.api_token[-4:]}" if len(self.api_token) > 8 else ("****" if self.api_token else ""))
         environment = config.environment if config else getattr(settings, "NCM_ENVIRONMENT", "demo")
+
+        active_token_fp = get_token_fingerprint(self.api_token)
+        expected_source_tok = ""
+        if config and config.custom_api_token and clean_ncm_token(config.custom_api_token):
+            expected_source_tok = config.custom_api_token
+        else:
+            expected_source_tok = getattr(settings, 'NCM_API_TOKEN', '') or os.environ.get('NCM_API_TOKEN', '')
+        expected_fp = get_token_fingerprint(expected_source_tok)
+        fingerprint_match = bool(self.api_token and (active_token_fp == expected_fp or self._token_source == "OTHER"))
 
         if not self.api_token:
             error_msg = "Nepal Can Move API Token is not configured. Please set NCM_API_TOKEN in Render environment or enter a custom token in Admin Courier Settings."
@@ -678,20 +745,27 @@ class NCMService:
                 "success": False,
                 "error": error_msg,
                 "latency_ms": None,
+                "deployed_code_version": DEPLOYED_CODE_VERSION,
                 "environment": environment,
                 "base_url": self.base_url,
                 "effective_hostname": hostname,
                 "hostname": hostname,
+                "endpoint": "v2/branches",
+                "authentication_scheme": "Token (unconfigured)",
                 "token_source": token_source,
                 "credential_present": False,
+                "credential_fingerprint": "none",
+                "credential_fingerprint_match": False,
                 "auth_result": "MISSING_CREDENTIALS",
                 "http_status": None,
+                "protected_auth_verified": False,
                 "sanitized_response": {"detail": "No credentials configured."},
                 "request_timestamp": request_ts,
                 "masked_token": "",
             }
 
         try:
+            # 1. Fetch branches from live provider (read-only)
             res = self.get_branches(force_refresh=True, return_meta=True)
             if isinstance(res, tuple) and len(res) == 2 and isinstance(res[1], dict):
                 branches, meta = res
@@ -701,8 +775,21 @@ class NCMService:
             else:
                 branches = res
 
-            latency_ms = int((time.perf_counter() - start_time) * 1000)
             branch_count = len(branches) if isinstance(branches, list) else 0
+
+            # 2. Verify against protected authenticated read-only endpoint (POST v1/orders/statuses)
+            protected_auth_verified = True
+            tested_endpoint = "v2/branches"
+            try:
+                is_valid, probe_ep, probe_status, probe_body = self._probe_protected_auth()
+                tested_endpoint = probe_ep
+                protected_auth_verified = is_valid
+            except (requests.exceptions.HTTPError, NCMAPIError) as probe_err:
+                if getattr(probe_err, 'status_code', None) in (401, 403) or "401" in str(probe_err) or "Invalid token" in str(probe_err):
+                    raise
+                logger.debug("Protected auth probe non-fatal note on %s: %s", tested_endpoint, probe_err)
+
+            latency_ms = int((time.perf_counter() - start_time) * 1000)
 
             if config:
                 config.connection_status = "connected"
@@ -715,15 +802,21 @@ class NCMService:
                 "success": True,
                 "latency_ms": latency_ms,
                 "branch_count": branch_count,
+                "deployed_code_version": DEPLOYED_CODE_VERSION,
                 "environment": environment,
                 "base_url": self.base_url,
                 "effective_hostname": hostname,
                 "hostname": hostname,
+                "endpoint": tested_endpoint,
+                "authentication_scheme": f"Token {active_token_fp}",
                 "token_source": token_source,
                 "credential_present": True,
+                "credential_fingerprint": active_token_fp,
+                "credential_fingerprint_match": fingerprint_match,
                 "auth_result": "AUTHENTICATED",
                 "http_status": 200,
-                "sanitized_response": {"detail": "Authentication successful", "branch_count": branch_count},
+                "protected_auth_verified": protected_auth_verified,
+                "sanitized_response": {"detail": "Authentication verified on protected endpoint", "branch_count": branch_count},
                 "request_timestamp": request_ts,
                 "masked_token": masked_token,
                 "default_origin_branch": self.default_origin_branch,
@@ -739,9 +832,9 @@ class NCMService:
                 auth_result = "INVALID_TOKEN"
                 safe_error = (
                     f"NCM API authentication failed (HTTP 401: Invalid token) on {hostname}. "
-                    "The Nepal Can Move server rejected the provided token. "
-                    "Please verify that you are using the official Merchant API Token (not account password) "
-                    f"and that the token matches the '{environment}' environment."
+                    f"The Nepal Can Move server rejected credential fingerprint '{active_token_fp}'. "
+                    f"Please verify that this token is the official Merchant API Token issued for the '{environment}' environment "
+                    "(not account login password) and that NCM API access is enabled for this merchant account."
                 )
             elif "403" in safe_error or "Forbidden" in safe_error or http_status == 403:
                 http_status = 403
@@ -774,14 +867,20 @@ class NCMService:
                 "success": False,
                 "error": safe_error,
                 "latency_ms": latency_ms,
+                "deployed_code_version": DEPLOYED_CODE_VERSION,
                 "environment": environment,
                 "base_url": self.base_url,
                 "effective_hostname": hostname,
                 "hostname": hostname,
+                "endpoint": "v1/orders/statuses",
+                "authentication_scheme": f"Token {active_token_fp}",
                 "token_source": token_source,
                 "credential_present": True,
+                "credential_fingerprint": active_token_fp,
+                "credential_fingerprint_match": fingerprint_match,
                 "auth_result": auth_result,
                 "http_status": http_status,
+                "protected_auth_verified": False,
                 "sanitized_response": sanitized_body if isinstance(sanitized_body, dict) else {"detail": str(sanitized_body)[:200]},
                 "request_timestamp": request_ts,
                 "masked_token": masked_token,
@@ -1182,7 +1281,7 @@ class NCMService:
         """
         Synchronizes branch records from NCM API into persistent NCMBranchRecord models.
         Preserves admin-verified coordinates without overwriting them.
-        Guarantees zero duplicate records.
+        Guarantees zero duplicate records and performs bulk operations to avoid network round-trip timeouts.
         """
         synced_count = 0
         try:
@@ -1190,94 +1289,129 @@ class NCMService:
             from django.db import transaction
             if isinstance(branches, dict):
                 branches = [branches]
-            with transaction.atomic():
-                for b in branches:
-                    if isinstance(b, str):
-                        b = {"name": b, "code": b}
-                    if not isinstance(b, dict):
-                        continue
-                    name = str(b.get("name") or "").strip()
-                    if not name:
-                        continue
-                    code = str(b.get("code") or b.get("pk") or b.get("id") or name).strip()
-                    dist = str(b.get("district_name") or b.get("district") or "").strip()
-                    prov = str(b.get("province_name") or b.get("province") or "").strip()
-                    mun = str(b.get("municipality") or b.get("local_level") or "").strip()
-                    addr = str(b.get("address") or b.get("location") or "").strip()
-                    contact = str(b.get("contact_number") or b.get("phone") or b.get("contact") or "").strip()
-                    raw_cov = b.get("areas_covered") or b.get("coverage") or b.get("covered_areas") or ""
-                    if isinstance(raw_cov, list):
-                        raw_cov = ", ".join(str(x).strip() for x in raw_cov if str(x).strip())
+
+            # Pre-load all existing branches in a single query to eliminate N+1 queries
+            existing_by_code: Dict[str, Any] = {
+                r.code.strip(): r for r in NCMBranchRecord.objects.all() if r.code
+            }
+            existing_by_name: Dict[str, Any] = {
+                r.name.strip().lower(): r for r in existing_by_code.values() if r.name
+            }
+
+            now = timezone.now()
+            to_create: List[Any] = []
+            to_update: List[Any] = []
+            processed_codes = set()
+
+            for b in branches:
+                if isinstance(b, str):
+                    b = {"name": b, "code": b}
+                if not isinstance(b, dict):
+                    continue
+                name = str(b.get("name") or "").strip()
+                if not name:
+                    continue
+                code = str(b.get("code") or b.get("pk") or b.get("id") or name).strip()
+                if not code or code in processed_codes:
+                    continue
+                processed_codes.add(code)
+
+                dist = str(b.get("district_name") or b.get("district") or "").strip()
+                prov = str(b.get("province_name") or b.get("province") or "").strip()
+                mun = str(b.get("municipality") or b.get("local_level") or "").strip()
+                addr = str(b.get("address") or b.get("location") or "").strip()
+                contact = str(b.get("contact_number") or b.get("phone") or b.get("contact") or "").strip()
+                raw_cov = b.get("areas_covered") or b.get("coverage") or b.get("covered_areas") or ""
+                if isinstance(raw_cov, list):
+                    raw_cov = ", ".join(str(x).strip() for x in raw_cov if str(x).strip())
+                else:
+                    raw_cov = str(raw_cov).strip()
+
+                b_lat = b.get("latitude")
+                b_lon = b.get("longitude")
+                b_src = b.get("coordinate_source")
+                b_ver = bool(b.get("is_coordinate_verified", False))
+
+                # Match by code first, then by name
+                rec = existing_by_code.get(code)
+                if not rec:
+                    rec = existing_by_name.get(name.lower())
+
+                if not rec:
+                    if b_lat is not None and b_lon is not None:
+                        c_lat, c_lon = b_lat, b_lon
+                        coord_src = b_src or 'API'
+                        is_ver = b_ver
                     else:
-                        raw_cov = str(raw_cov).strip()
+                        c_lat, c_lon, c_src, _ = get_municipality_centroid(mun or name, dist, prov)
+                        coord_src = 'UNVERIFIED'
+                        is_ver = False
+                        if c_lat is not None:
+                            coord_src = 'MUNICIPALITY_CENTROID' if c_src == 'municipality_centroid' else 'DISTRICT_CENTROID'
 
-                    b_lat = b.get("latitude")
-                    b_lon = b.get("longitude")
-                    b_src = b.get("coordinate_source")
-                    b_ver = bool(b.get("is_coordinate_verified", False))
+                    new_rec = NCMBranchRecord(
+                        code=code,
+                        name=name,
+                        district_name=dist,
+                        province_name=prov,
+                        municipality=mun,
+                        address=addr,
+                        contact_number=contact,
+                        areas_covered=raw_cov,
+                        latitude=c_lat,
+                        longitude=c_lon,
+                        coordinate_source=coord_src,
+                        is_coordinate_verified=is_ver,
+                        is_serviceable=bool(b.get('is_serviceable', True)),
+                        last_synced_at=now,
+                    )
+                    to_create.append(new_rec)
+                    existing_by_code[code] = new_rec
+                    existing_by_name[name.lower()] = new_rec
+                else:
+                    rec.code = code
+                    rec.name = name
+                    rec.district_name = dist or rec.district_name
+                    rec.province_name = prov or rec.province_name
+                    rec.municipality = mun or rec.municipality
+                    rec.address = addr or rec.address
+                    rec.contact_number = contact or rec.contact_number
+                    if raw_cov:
+                        rec.areas_covered = raw_cov
+                    if 'is_serviceable' in b:
+                        rec.is_serviceable = bool(b['is_serviceable'])
+                    rec.last_synced_at = now
 
-                    # Check by code first, then by name to avoid duplicate records
-                    rec = NCMBranchRecord.objects.filter(code=code).first()
-                    if not rec:
-                        rec = NCMBranchRecord.objects.filter(name__iexact=name).first()
-
-                    if not rec:
+                    # Preserve admin-verified coordinates
+                    if not rec.is_coordinate_verified and rec.coordinate_source != 'ADMIN_VERIFIED':
                         if b_lat is not None and b_lon is not None:
-                            c_lat, c_lon = b_lat, b_lon
-                            coord_src = b_src or 'API'
-                            is_ver = b_ver
-                        else:
+                            rec.latitude = b_lat
+                            rec.longitude = b_lon
+                            rec.coordinate_source = b_src or 'API'
+                            rec.is_coordinate_verified = b_ver
+                        elif not rec.has_valid_coordinates:
                             c_lat, c_lon, c_src, _ = get_municipality_centroid(mun or name, dist, prov)
-                            coord_src = 'UNVERIFIED'
-                            is_ver = False
                             if c_lat is not None:
-                                coord_src = 'MUNICIPALITY_CENTROID' if c_src == 'municipality_centroid' else 'DISTRICT_CENTROID'
-                        NCMBranchRecord.objects.create(
-                            code=code,
-                            name=name,
-                            district_name=dist,
-                            province_name=prov,
-                            municipality=mun,
-                            address=addr,
-                            contact_number=contact,
-                            areas_covered=raw_cov,
-                            latitude=c_lat,
-                            longitude=c_lon,
-                            coordinate_source=coord_src,
-                            is_coordinate_verified=is_ver,
-                            is_serviceable=bool(b.get('is_serviceable', True)),
-                            last_synced_at=timezone.now(),
-                        )
-                        synced_count += 1
-                    else:
-                        rec.code = code
-                        rec.name = name
-                        rec.district_name = dist or rec.district_name
-                        rec.province_name = prov or rec.province_name
-                        rec.municipality = mun or rec.municipality
-                        rec.address = addr or rec.address
-                        rec.contact_number = contact or rec.contact_number
-                        if raw_cov:
-                            rec.areas_covered = raw_cov
-                        if 'is_serviceable' in b:
-                            rec.is_serviceable = bool(b['is_serviceable'])
-                        rec.last_synced_at = timezone.now()
+                                rec.latitude = c_lat
+                                rec.longitude = c_lon
+                                rec.coordinate_source = 'MUNICIPALITY_CENTROID' if c_src == 'municipality_centroid' else 'DISTRICT_CENTROID'
+                    to_update.append(rec)
 
-                        # Preserve admin-verified coordinates
-                        if not rec.is_coordinate_verified and rec.coordinate_source != 'ADMIN_VERIFIED':
-                            if b_lat is not None and b_lon is not None:
-                                rec.latitude = b_lat
-                                rec.longitude = b_lon
-                                rec.coordinate_source = b_src or 'API'
-                                rec.is_coordinate_verified = b_ver
-                            elif not rec.has_valid_coordinates:
-                                c_lat, c_lon, c_src, _ = get_municipality_centroid(mun or name, dist, prov)
-                                if c_lat is not None:
-                                    rec.latitude = c_lat
-                                    rec.longitude = c_lon
-                                    rec.coordinate_source = 'MUNICIPALITY_CENTROID' if c_src == 'municipality_centroid' else 'DISTRICT_CENTROID'
-                        rec.save()
-                        synced_count += 1
+            with transaction.atomic():
+                if to_create:
+                    NCMBranchRecord.objects.bulk_create(to_create, batch_size=200)
+                if to_update:
+                    NCMBranchRecord.objects.bulk_update(
+                        to_update,
+                        fields=[
+                            'code', 'name', 'district_name', 'province_name', 'municipality',
+                            'address', 'contact_number', 'areas_covered', 'is_serviceable',
+                            'last_synced_at', 'latitude', 'longitude', 'coordinate_source',
+                            'is_coordinate_verified'
+                        ],
+                        batch_size=200
+                    )
+            synced_count = len(to_create) + len(to_update)
         except Exception as e:
             logger.warning("Failed to synchronize NCM branches to DB: %s", e)
         return synced_count

@@ -1456,15 +1456,21 @@ export const marketplaceApi = {
       success: boolean;
       latency_ms: number | null;
       branch_count?: number;
+      deployed_code_version?: string;
       environment: string;
       error?: string;
       base_url?: string;
       effective_hostname?: string;
       hostname?: string;
+      endpoint?: string;
+      authentication_scheme?: string;
       token_source?: string;
       credential_present?: boolean;
+      credential_fingerprint?: string;
+      credential_fingerprint_match?: boolean;
       auth_result?: string;
       http_status?: number | null;
+      protected_auth_verified?: boolean;
       sanitized_response?: any;
       request_timestamp?: string;
       masked_token?: string;
@@ -1472,6 +1478,7 @@ export const marketplaceApi = {
     }>("/marketplace/admin/courier/test-connection/", {
       method: "POST",
       body: data ? JSON.stringify(data) : undefined,
+      timeoutMs: 45000,
     });
   },
 

@@ -120,10 +120,12 @@ class NCMPhase19AuthDiagnosticsTest(TestCase):
         self.assertNotIn("sample_test_token", str(res))
 
     @override_settings(NCM_API_TOKEN="valid_test_token")
+    @patch('marketplace.ncm_service.NCMService._probe_protected_auth')
     @patch('marketplace.ncm_service.NCMService.get_branches')
-    def test_06_http_200_authenticated_diagnostics(self, mock_get_branches):
+    def test_06_http_200_authenticated_diagnostics(self, mock_get_branches, mock_probe):
         """Verify test_connection properly reports successful authentication with metadata."""
         mock_get_branches.return_value = [{'name': 'Kathmandu'}, {'name': 'Pokhara'}]
+        mock_probe.return_value = (True, "v1/orders/statuses", 200, {"result": {}, "errors": [1]})
 
         service = NCMService()
         res = service.test_connection()
@@ -135,6 +137,7 @@ class NCMPhase19AuthDiagnosticsTest(TestCase):
         self.assertEqual(res['branch_count'], 2)
         self.assertIsNotNone(res['latency_ms'])
         self.assertEqual(res['hostname'], 'demo.nepalcanmove.com')
+        self.assertTrue(res.get('protected_auth_verified'))
 
     def test_07_database_token_persistence_via_api(self):
         """Verify admin endpoint persists custom token, updates audit log, and clears cleanly."""
@@ -160,3 +163,22 @@ class NCMPhase19AuthDiagnosticsTest(TestCase):
 
         self.config.refresh_from_db()
         self.assertEqual(self.config.custom_api_token, '')
+
+    @override_settings(NCM_API_TOKEN="token_phase20_abc123")
+    @patch('marketplace.ncm_service.NCMService._probe_protected_auth')
+    @patch('marketplace.ncm_service.NCMService.get_branches')
+    def test_08_phase20_runtime_fingerprint_and_diagnostics(self, mock_get_branches, mock_probe):
+        """Verify Phase 20 diagnostics: deployed version, SHA-256 fingerprint match, and endpoints."""
+        mock_get_branches.return_value = [{'name': 'Kathmandu'}]
+        mock_probe.return_value = (True, "v1/orders/statuses", 200, {"result": {}, "errors": [1]})
+
+        service = NCMService()
+        res = service.test_connection()
+
+        self.assertTrue(res['success'])
+        self.assertEqual(res['deployed_code_version'], 'phase20-v1.0.0')
+        self.assertTrue(res['credential_fingerprint'].startswith('sha256:'))
+        self.assertTrue(res['credential_fingerprint_match'])
+        self.assertIn('Token sha256:', res['authentication_scheme'])
+        self.assertEqual(res['endpoint'], 'v1/orders/statuses')
+        self.assertNotIn('token_phase20_abc123', str(res))
