@@ -67,6 +67,7 @@ urlpatterns = [
     path('api/analytics/', include('analytics.urls')),
     path('api/notes/', include('notes.urls')),
     path('api/marketplace/', include('marketplace.urls')),
+    path('marketplace/', include('marketplace.urls')),
     path('api/games/', include('games.urls')),
     path('api/study-plan/', include('study_plan.urls')),
     path('api/admin/', include('administration.urls')),

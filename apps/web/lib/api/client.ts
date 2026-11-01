@@ -20,6 +20,12 @@ export function getApiBaseUrl(): string {
   if (!/^https?:\/\//i.test(url)) {
     url = `https://${url}`;
   }
+
+  // Ensure API base URL always ends with /api (immune to whether NEXT_PUBLIC_API_URL includes /api)
+  if (!url.endsWith("/api")) {
+    url = `${url}/api`;
+  }
+
   return url;
 }
 
@@ -273,7 +279,7 @@ async function executeRequest<T>(
   endpoint: string,
   options: ApiClientOptions = {}
 ): Promise<T> {
-  const url = `${getApiBaseUrl()}${endpoint}`;
+  const url = buildApiUrl(endpoint);
   
   const token = getAuthToken();
   const headers = new Headers(options.headers || {});
@@ -430,7 +436,7 @@ export async function downloadFile(
   endpoint: string,
   fallbackFilename: string
 ): Promise<void> {
-  const url = `${API_URL}${endpoint}`;
+  const url = buildApiUrl(endpoint);
   const token = getAuthToken();
   const headers = new Headers();
   if (token) headers.set("Authorization", `Bearer ${token}`);

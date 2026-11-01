@@ -1092,7 +1092,8 @@ class NCMConfigurationSerializer(serializers.ModelSerializer):
     def update(self, instance, validated_data):
         new_token = validated_data.pop('new_api_token', None)
         if new_token is not None:
-            clean_token = new_token.strip()
+            from .models import clean_ncm_token
+            clean_token = clean_ncm_token(new_token)
             instance.custom_api_token = clean_token
 
         for attr, value in validated_data.items():

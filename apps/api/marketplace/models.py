@@ -977,6 +977,18 @@ class SellerPayout(models.Model):
 # Nepal Can Move (NCM) Admin Configuration & COD Remittance Management
 # ---------------------------------------------------------------------------
 
+def clean_ncm_token(token) -> str:
+    """Sanitize NCM API token by stripping surrounding quotes, whitespace, and leading 'Token'/'Bearer' prefixes."""
+    if not token:
+        return ""
+    clean = str(token).strip().strip("\"'").strip()
+    if clean.lower().startswith("token "):
+        clean = clean[6:].strip()
+    elif clean.lower().startswith("bearer "):
+        clean = clean[7:].strip()
+    return clean.strip("\"'").strip()
+
+
 class NCMConfiguration(models.Model):
     """
     Singleton configuration model for Nepal Can Move (NCM) courier integration.
@@ -1088,9 +1100,8 @@ class NCMConfiguration(models.Model):
         return url
 
     def get_effective_token(self):
-        if self.custom_api_token:
-            return self.custom_api_token.strip()
-        return getattr(settings, 'NCM_API_TOKEN', '').strip()
+        raw = self.custom_api_token or getattr(settings, 'NCM_API_TOKEN', '')
+        return clean_ncm_token(raw)
 
     def get_masked_token(self):
         token = self.get_effective_token()

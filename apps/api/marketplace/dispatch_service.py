@@ -331,14 +331,19 @@ def execute_ncm_dispatch(
 
     except (NCMAPIError, NCMValidationError, NCMError) as exc:
         logger.error("NCM shipment creation API error for Order #%s: %s", order_id, exc)
+        err_str = str(exc)
+        if "401" in err_str or "Invalid token" in err_str:
+            last_error = "NCM API authentication failed (401: Invalid Token). Please update NCM_API_TOKEN in Render or Admin Courier Settings."
+        else:
+            last_error = f"NCM API error: {err_str}"
         with transaction.atomic():
             order = Order.objects.select_for_update().get(pk=order_id)
             order.ncm_dispatch_status = 'FAILED'
             order.ncm_dispatch_attempts += 1
-            order.ncm_dispatch_last_error = f"NCM API error: {str(exc)}"
+            order.ncm_dispatch_last_error = last_error
             order.ncm_dispatch_next_retry = None  # API errors are usually deterministic, do not auto retry
             order.save(update_fields=['ncm_dispatch_status', 'ncm_dispatch_attempts', 'ncm_dispatch_last_error', 'ncm_dispatch_next_retry'])
-        return {"status": "FAILED", "error": str(exc)}
+        return {"status": "FAILED", "error": last_error}
 
     # 3. Successful dispatch from NCM API
     return _persist_successful_ncm_shipment(

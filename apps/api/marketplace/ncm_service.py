@@ -607,12 +607,16 @@ class NCMService:
         except Exception:
             config = None
 
+        raw_token = ""
         if api_token is not None:
-            self.api_token = api_token.strip()
+            raw_token = api_token
         elif config and config.get_effective_token():
-            self.api_token = config.get_effective_token().strip()
+            raw_token = config.get_effective_token()
         else:
-            self.api_token = getattr(settings, "NCM_API_TOKEN", "").strip()
+            raw_token = getattr(settings, "NCM_API_TOKEN", "")
+
+        from .models import clean_ncm_token
+        self.api_token = clean_ncm_token(raw_token)
 
         if base_url is not None:
             raw_base = base_url.strip()
@@ -701,6 +705,10 @@ class NCMService:
         except Exception as exc:
             latency_ms = int((time.perf_counter() - start_time) * 1000)
             safe_error = str(exc)
+            if "401" in safe_error or "Invalid token" in safe_error:
+                safe_error = "NCM API authentication failed (HTTP 401: Invalid token). Please verify your NCM API token in Render or Admin Courier Settings."
+            elif "Connection refused" in safe_error or "Failed to establish" in safe_error:
+                safe_error = f"Cannot reach NCM API endpoint ({self.base_url}). Network connection failed."
             if config:
                 config.connection_status = "error"
                 config.last_connection_tested_at = timezone.now()
