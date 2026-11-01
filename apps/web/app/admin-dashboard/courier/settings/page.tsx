@@ -239,6 +239,23 @@ export default function CourierSettingsPage() {
     }
   };
 
+  const handleClearDatabaseToken = async () => {
+    try {
+      setSaving(true);
+      const updated = await marketplaceApi.adminUpdateCourierSettings({
+        clear_database_token: true,
+        new_api_token: "",
+      });
+      setConfig(updated);
+      setNewToken("");
+      toast.success("Database token override cleared. Active token now falls back to Render environment variable.");
+    } catch (err: any) {
+      toast.error(err.message || "Failed to clear database token override");
+    } finally {
+      setSaving(false);
+    }
+  };
+
   const handleToggleWebhook = async () => {
     try {
       const res = await marketplaceApi.adminActionNCMWebhook("toggle_enabled");
@@ -410,6 +427,22 @@ export default function CourierSettingsPage() {
                   className="w-full text-xs rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono text-slate-800 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-[#D4A72C]/50"
                 />
               </div>
+
+              {config?.token_source === "DATABASE" && (
+                <div className="flex items-center justify-between pt-1">
+                  <span className="text-[11px] text-amber-700 font-medium">
+                    Token is currently overridden in the database.
+                  </span>
+                  <button
+                    type="button"
+                    onClick={handleClearDatabaseToken}
+                    disabled={saving}
+                    className="text-[11px] text-rose-600 hover:text-rose-700 font-semibold underline disabled:opacity-50 cursor-pointer"
+                  >
+                    Reset to Render Environment Variable
+                  </button>
+                </div>
+              )}
             </div>
 
             {/* Base URL override */}
