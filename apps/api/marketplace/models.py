@@ -979,12 +979,21 @@ class SellerPayout(models.Model):
 # ---------------------------------------------------------------------------
 
 def clean_ncm_token(token) -> str:
-    """Sanitize NCM API token by stripping surrounding quotes, whitespace, and leading 'Token'/'Bearer' prefixes."""
+    """
+    Sanitize NCM API token by stripping surrounding quotes, whitespace,
+    newlines, and common prefix headers (Authorization:, Token, Bearer).
+    """
     if not token:
         return ""
-    clean = str(token).strip().strip("\"'").strip()
-    if clean.lower().startswith("token "):
+    clean = str(token).strip().strip("\r\n\t ").strip("\"'").strip()
+    if clean.lower().startswith("authorization:"):
+        clean = clean[14:].strip()
+    if clean.lower().startswith("token:"):
         clean = clean[6:].strip()
+    elif clean.lower().startswith("token "):
+        clean = clean[6:].strip()
+    elif clean.lower().startswith("bearer:"):
+        clean = clean[7:].strip()
     elif clean.lower().startswith("bearer "):
         clean = clean[7:].strip()
     return clean.strip("\"'").strip()
@@ -1097,13 +1106,10 @@ class NCMConfiguration(models.Model):
         return obj
 
     def get_effective_base_url(self):
-        # 1. Custom base URL override in database
+        # 1. Custom base URL override in database (if explicitly configured)
         if self.custom_base_url and self.custom_base_url.strip():
             url = self.custom_base_url.strip()
-        # 2. Explicit base URL override from environment variable (only if explicitly set in os.environ)
-        elif getattr(settings, 'NCM_EXPLICIT_BASE_URL', os.environ.get('NCM_BASE_URL', '')).strip():
-            url = getattr(settings, 'NCM_EXPLICIT_BASE_URL', os.environ.get('NCM_BASE_URL', '')).strip()
-        # 3. Environment matching (production vs demo) strictly derived from self.environment
+        # 2. Strict environment mapping derived from self.environment
         elif self.environment == 'production':
             url = 'https://portal.nepalcanmove.com/api/'
         else:
@@ -1113,10 +1119,10 @@ class NCMConfiguration(models.Model):
         return url
 
     def get_effective_token(self):
-        # Database custom token override takes precedence if set, otherwise Render/environment variable
+        # Database custom token override takes precedence if set and non-empty, otherwise Render/environment variable
         raw = self.custom_api_token.strip() if self.custom_api_token else ''
-        if not raw:
-            raw = (os.environ.get('NCM_API_TOKEN') or getattr(settings, 'NCM_API_TOKEN', '')).strip()
+        if not clean_ncm_token(raw):
+            raw = (getattr(settings, 'NCM_API_TOKEN', '') or os.environ.get('NCM_API_TOKEN', '')).strip()
         return clean_ncm_token(raw)
 
     def get_masked_token(self):
@@ -1129,11 +1135,11 @@ class NCMConfiguration(models.Model):
 
     def get_token_source(self):
         if self.custom_api_token and clean_ncm_token(self.custom_api_token):
-            return 'DATABASE'
-        env_tok = (os.environ.get('NCM_API_TOKEN') or getattr(settings, 'NCM_API_TOKEN', '')).strip()
+            return 'DATABASE_CUSTOM_TOKEN'
+        env_tok = (getattr(settings, 'NCM_API_TOKEN', '') or os.environ.get('NCM_API_TOKEN', '')).strip()
         if env_tok and clean_ncm_token(env_tok):
-            return 'ENVIRONMENT'
-        return 'NOT_CONFIGURED'
+            return 'RENDER_ENVIRONMENT_TOKEN'
+        return 'MISSING'
 
 
 class NCMWebhookEvent(models.Model):

@@ -1523,7 +1523,21 @@ class AdminNCMTestConnectionView(APIView):
     permission_classes = [IsAdminUser]
 
     def post(self, request):
-        service = NCMService()
+        test_token = request.data.get('test_token') or request.data.get('new_api_token')
+        test_env = request.data.get('environment')
+        test_base_url = request.data.get('custom_base_url')
+
+        if test_token is not None and str(test_token).strip():
+            from .models import clean_ncm_token
+            clean_tok = clean_ncm_token(test_token)
+            base = test_base_url.strip() if test_base_url and test_base_url.strip() else None
+            if not base and test_env:
+                base = 'https://portal.nepalcanmove.com/api/' if test_env == 'production' else 'https://demo.nepalcanmove.com/api/'
+            service = NCMService(api_token=clean_tok, base_url=base)
+            service._token_source = "DATABASE_CUSTOM_TOKEN" if clean_tok else "MISSING"
+        else:
+            service = NCMService()
+
         result = service.test_connection()
 
         try:
@@ -1537,6 +1551,9 @@ class AdminNCMTestConnectionView(APIView):
                     'success': result.get('success'),
                     'latency_ms': result.get('latency_ms'),
                     'environment': result.get('environment'),
+                    'auth_result': result.get('auth_result'),
+                    'token_source': result.get('token_source'),
+                    'http_status': result.get('http_status'),
                 }
             )
         except Exception:

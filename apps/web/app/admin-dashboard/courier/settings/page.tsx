@@ -120,9 +120,14 @@ export default function CourierSettingsPage() {
   const handleTestConnection = async () => {
     try {
       setTesting(true);
-      const res = await marketplaceApi.adminTestNCMConnection();
+      const payload = newToken.trim() ? {
+        test_token: newToken.trim(),
+        environment,
+        custom_base_url: customBaseUrl,
+      } : undefined;
+      const res = await marketplaceApi.adminTestNCMConnection(payload);
       if (res.success) {
-        toast.success(`Connection verified! Response time: ${res.latency_ms}ms (${res.branch_count} branches reachable)`);
+        toast.success(`Connection verified (${res.effective_hostname || res.base_url})! Response time: ${res.latency_ms}ms (${res.branch_count} branches reachable)`);
       } else {
         toast.error(`Connection diagnostic failed: ${res.error || "Unknown error"}`);
       }
@@ -393,8 +398,11 @@ export default function CourierSettingsPage() {
                   <div className="flex-1 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 text-xs font-mono text-slate-700">
                     {config?.masked_token || "No Token Configured"}
                   </div>
-                  <span className="text-[11px] font-medium px-2 py-1 rounded bg-slate-100 text-slate-600 capitalize">
-                    {config?.token_source || "None"}
+                  <span className="text-[11px] font-medium px-2 py-1 rounded bg-slate-100 text-slate-700">
+                    {config?.token_source === "DATABASE_CUSTOM_TOKEN" || config?.token_source === "DATABASE" ? "Database Custom Token" :
+                     config?.token_source === "RENDER_ENVIRONMENT_TOKEN" || config?.token_source === "ENVIRONMENT" ? "Render Environment Token" :
+                     config?.token_source === "MISSING" || !config?.token_source ? "Missing / Not Configured" :
+                     config?.token_source}
                   </span>
                 </div>
                 <p className="text-[11px] text-slate-400 mt-1">
@@ -428,7 +436,7 @@ export default function CourierSettingsPage() {
                 />
               </div>
 
-              {(config?.token_source === "DATABASE" || config?.token_source === "database") && (
+              {(config?.token_source === "DATABASE" || config?.token_source === "DATABASE_CUSTOM_TOKEN" || config?.token_source === "database") && (
                 <div className="flex items-center justify-between pt-1">
                   <span className="text-[11px] text-amber-700 font-medium">
                     Token is currently overridden in the database.

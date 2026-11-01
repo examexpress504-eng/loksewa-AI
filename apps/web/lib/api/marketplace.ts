@@ -352,7 +352,7 @@ export interface NCMConfiguration {
   custom_base_url: string;
   effective_base_url: string;
   masked_token: string;
-  token_source: "database" | "environment" | "not_configured" | "DATABASE" | "ENVIRONMENT" | "NOT_CONFIGURED";
+  token_source: "DATABASE_CUSTOM_TOKEN" | "RENDER_ENVIRONMENT_TOKEN" | "MISSING" | "database" | "environment" | "not_configured" | "DATABASE" | "ENVIRONMENT" | "NOT_CONFIGURED" | string;
   has_token: boolean;
   new_api_token?: string;
   clear_database_token?: boolean;
@@ -1451,7 +1451,7 @@ export const marketplaceApi = {
     });
   },
 
-  adminTestNCMConnection: async () => {
+  adminTestNCMConnection: async (data?: { test_token?: string; environment?: string; custom_base_url?: string }) => {
     return apiClient<{
       success: boolean;
       latency_ms: number | null;
@@ -1459,9 +1459,19 @@ export const marketplaceApi = {
       environment: string;
       error?: string;
       base_url?: string;
+      effective_hostname?: string;
+      hostname?: string;
+      token_source?: string;
+      credential_present?: boolean;
+      auth_result?: string;
+      http_status?: number | null;
+      sanitized_response?: any;
+      request_timestamp?: string;
+      masked_token?: string;
       default_origin_branch?: string;
     }>("/marketplace/admin/courier/test-connection/", {
       method: "POST",
+      body: data ? JSON.stringify(data) : undefined,
     });
   },
 
