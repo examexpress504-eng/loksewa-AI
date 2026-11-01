@@ -610,6 +610,20 @@ def process_ncm_dispatch_queue(limit: int = 50) -> Dict[str, Any]:
             )
             for ord_obj in queued_orders:
                 order_ids_to_process.append(ord_obj.id)
+
+            from .models import NCMDispatchJob
+            remaining = limit - len(order_ids_to_process)
+            if remaining > 0:
+                queued_jobs = list(
+                    NCMDispatchJob.objects.filter(
+                        status='QUEUED',
+                        order__courier_shipment__isnull=True,
+                    ).exclude(
+                        order_id__in=order_ids_to_process
+                    ).select_for_update(skip_locked=True)[:remaining]
+                )
+                for j in queued_jobs:
+                    order_ids_to_process.append(j.order_id)
     except Exception as exc:
         logger.warning("Could not lock queued orders for dispatch queue processing: %s", exc)
         return {"processed": 0, "succeeded": 0, "failed": 0, "error": str(exc)}

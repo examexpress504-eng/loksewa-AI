@@ -1557,7 +1557,12 @@ class AdminNCMBranchesView(APIView):
         service = NCMService()
         force_refresh = request.query_params.get('force_refresh', '').lower() in ('1', 'true')
         try:
-            branches, meta = service.get_branches(force_refresh=force_refresh, return_meta=True)
+            res = service.get_branches(force_refresh=force_refresh, return_meta=True)
+            if isinstance(res, tuple) and len(res) == 2 and isinstance(res[1], dict):
+                branches, meta = res
+            else:
+                branches = res if isinstance(res, list) else [res]
+                meta = {'source': 'DATABASE_CACHE', 'count': len(branches)}
             service.sync_branches_to_db(branches)
 
             records = NCMBranchRecord.objects.all()
@@ -1609,7 +1614,12 @@ class AdminNCMBranchesView(APIView):
         """Force refresh branches cache from live NCM API and sync to DB."""
         service = NCMService()
         try:
-            branches, meta = service.get_branches(force_refresh=True, return_meta=True)
+            res = service.get_branches(force_refresh=True, return_meta=True)
+            if isinstance(res, tuple) and len(res) == 2 and isinstance(res[1], dict):
+                branches, meta = res
+            else:
+                branches = res if isinstance(res, list) else [res]
+                meta = {'source': 'LIVE_API', 'count': len(branches)}
             service.sync_branches_to_db(branches)
             records = NCMBranchRecord.objects.all()
             if records.exists():

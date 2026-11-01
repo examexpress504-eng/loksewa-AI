@@ -669,7 +669,14 @@ class NCMService:
             }
 
         try:
-            branches = self.get_branches(force_refresh=True)
+            res = self.get_branches(force_refresh=True, return_meta=True)
+            if isinstance(res, tuple) and len(res) == 2 and isinstance(res[1], dict):
+                branches, meta = res
+                if meta.get("source") != "LIVE_API":
+                    sync_err = meta.get("sync_error") or "Live API connection failed (fallback catalog returned)."
+                    raise NCMAPIError(sync_err)
+            else:
+                branches = res
             latency_ms = int((time.perf_counter() - start_time) * 1000)
             if config:
                 config.connection_status = "connected"
@@ -1110,7 +1117,13 @@ class NCMService:
         synced_count = 0
         try:
             from .models import NCMBranchRecord
+            if isinstance(branches, dict):
+                branches = [branches]
             for b in branches:
+                if isinstance(b, str):
+                    b = {"name": b, "code": b}
+                if not isinstance(b, dict):
+                    continue
                 name = str(b.get("name") or "").strip()
                 if not name:
                     continue
