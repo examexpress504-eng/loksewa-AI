@@ -760,12 +760,10 @@ BACKUP_KEEP_LOCAL_COPY = os.environ.get('BACKUP_KEEP_LOCAL_COPY', 'true').lower(
 # --- NEPAL CAN MOVE (NCM) COURIER CONFIGURATION ---
 NCM_API_TOKEN = os.environ.get('NCM_API_TOKEN', '').strip()
 NCM_ENVIRONMENT = os.environ.get('NCM_ENVIRONMENT', 'demo').strip().lower()
-NCM_BASE_URL = os.environ.get('NCM_BASE_URL', '').strip()
-if not NCM_BASE_URL:
-    if NCM_ENVIRONMENT == 'production':
-        NCM_BASE_URL = 'https://portal.nepalcanmove.com/api/'
-    else:
-        NCM_BASE_URL = 'https://demo.nepalcanmove.com/api/'
+NCM_EXPLICIT_BASE_URL = os.environ.get('NCM_BASE_URL', '').strip()
+NCM_BASE_URL = NCM_EXPLICIT_BASE_URL or (
+    'https://portal.nepalcanmove.com/api/' if NCM_ENVIRONMENT == 'production' else 'https://demo.nepalcanmove.com/api/'
+)
 if NCM_BASE_URL and not NCM_BASE_URL.endswith('/'):
     NCM_BASE_URL += '/'
 

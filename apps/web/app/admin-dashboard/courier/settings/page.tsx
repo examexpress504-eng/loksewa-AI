@@ -41,6 +41,8 @@ export default function CourierSettingsPage() {
   const [config, setConfig] = useState<NCMConfiguration | null>(null);
   const [branches, setBranches] = useState<NCMBranch[]>([]);
   const [branchesCount, setBranchesCount] = useState<number>(0);
+  const [branchSource, setBranchSource] = useState<string>("DATABASE_CACHE");
+  const [branchLastSyncedAt, setBranchLastSyncedAt] = useState<string | null>(null);
   const [recentWebhooks, setRecentWebhooks] = useState<NCMWebhookEvent[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -98,6 +100,8 @@ export default function CourierSettingsPage() {
       if (branchesData?.branches) {
         setBranches(branchesData.branches);
         setBranchesCount(branchesData.count || branchesData.branches.length);
+        setBranchSource((branchesData as any).source || (configData as any).branch_sync_source || "DATABASE_CACHE");
+        setBranchLastSyncedAt((branchesData as any).last_synced_at || (configData as any).last_branch_sync_at || null);
       }
       if (webhookData?.recent_events) {
         setRecentWebhooks(webhookData.recent_events);
@@ -140,6 +144,8 @@ export default function CourierSettingsPage() {
       const res = await marketplaceApi.adminRefreshCourierBranches();
       setBranches(res.branches);
       setBranchesCount(res.count);
+      setBranchSource((res as any).source || "LIVE_API");
+      setBranchLastSyncedAt((res as any).last_synced_at || new Date().toISOString());
       toast.success(`Refreshed ${res.count} active NCM branches from provider.`);
     } catch (err: any) {
       toast.error(err.message || "Failed to refresh branches");
@@ -426,19 +432,36 @@ export default function CourierSettingsPage() {
 
           {/* Card B: Branch Configuration & Geographic Directory */}
           <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-xs space-y-4">
-            <div className="flex items-center justify-between pb-3 border-b border-slate-100">
+            <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between pb-3 border-b border-slate-100 gap-2">
               <div className="flex items-center gap-2">
                 <Server className="w-4 h-4 text-[#D4A72C]" />
                 <h3 className="font-bold text-slate-900 text-sm">B. Default Origin Branch & Geographic Directory</h3>
+                {/* Branch Provenance Badge */}
+                <span className={`px-2 py-0.5 rounded text-[10px] font-bold border ${
+                  branchSource === 'LIVE_API'
+                    ? 'bg-emerald-50 text-emerald-800 border-emerald-300'
+                    : branchSource === 'DATABASE_CACHE'
+                    ? 'bg-blue-50 text-blue-800 border-blue-300'
+                    : 'bg-amber-50 text-amber-800 border-amber-300'
+                }`}>
+                  SOURCE: {branchSource}
+                </span>
               </div>
-              <button
-                onClick={handleRefreshBranches}
-                disabled={refreshingBranches}
-                className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-md bg-slate-100 text-slate-700 hover:bg-slate-200 transition-colors disabled:opacity-60"
-              >
-                <RefreshCw className={`w-3 h-3 ${refreshingBranches ? "animate-spin text-[#D4A72C]" : ""}`} />
-                {refreshingBranches ? "Refreshing..." : `Refresh Cache (${branchesCount})`}
-              </button>
+              <div className="flex items-center gap-2">
+                {branchLastSyncedAt && (
+                  <span className="text-[11px] text-slate-400">
+                    Synced: {new Date(branchLastSyncedAt).toLocaleTimeString()}
+                  </span>
+                )}
+                <button
+                  onClick={handleRefreshBranches}
+                  disabled={refreshingBranches}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-md bg-slate-100 text-slate-700 hover:bg-slate-200 transition-colors disabled:opacity-60"
+                >
+                  <RefreshCw className={`w-3 h-3 ${refreshingBranches ? "animate-spin text-[#D4A72C]" : ""}`} />
+                  {refreshingBranches ? "Refreshing..." : `Refresh Live API (${branchesCount})`}
+                </button>
+              </div>
             </div>
 
             <div className="space-y-4">

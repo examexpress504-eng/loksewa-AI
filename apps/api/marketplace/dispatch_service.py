@@ -19,6 +19,7 @@ from marketplace.models import (
     CourierShipment,
     OrderStatusHistory,
     CODRemittance,
+    NCMDispatchJob,
 )
 from marketplace.ncm_service import (
     NCMService,
@@ -160,6 +161,32 @@ def validate_order_for_ncm_dispatch(order: Order, service: NCMService) -> Tuple[
     return True, None, ncm_payload
 
 
+def _sync_dispatch_job(
+    order_id: int,
+    status: str,
+    last_error: str = '',
+    attempts: Optional[int] = None,
+    next_retry_at: Optional[Any] = None,
+) -> None:
+    """Safely synchronizes durable NCMDispatchJob outbox record."""
+    try:
+        from marketplace.models import NCMDispatchJob
+        job = NCMDispatchJob.objects.filter(order_id=order_id).order_by('-created_at').first()
+        if not job:
+            job = NCMDispatchJob.objects.create(order_id=order_id, status=status)
+        job.status = status
+        job.last_attempt_at = timezone.now()
+        if last_error:
+            job.last_error = last_error
+        if attempts is not None:
+            job.attempts = attempts
+        if next_retry_at is not None:
+            job.next_retry_at = next_retry_at
+        job.save()
+    except Exception as e:
+        logger.debug("Failed to sync NCMDispatchJob for Order #%s: %s", order_id, e)
+
+
 def execute_ncm_dispatch(
     order_id: int,
     force_retry: bool = False,
@@ -186,6 +213,7 @@ def execute_ncm_dispatch(
                 order.ncm_dispatch_status = 'FAILED'
                 order.ncm_dispatch_last_error = "NCM courier service is not configured (missing API credentials)."
                 order.save(update_fields=['ncm_dispatch_status', 'ncm_dispatch_last_error'])
+                _sync_dispatch_job(order_id, status='FAILED', last_error=order.ncm_dispatch_last_error)
         return {"status": "FAILED", "error": "NCM courier service is not configured."}
 
     # 1. Acquire row lock and verify eligibility
@@ -201,6 +229,7 @@ def execute_ncm_dispatch(
             if order.ncm_dispatch_status != 'CREATED':
                 order.ncm_dispatch_status = 'CREATED'
                 order.save(update_fields=['ncm_dispatch_status'])
+            _sync_dispatch_job(order_id, status='COMPLETED')
             return {
                 "status": "ALREADY_DISPATCHED",
                 "ncm_order_id": order.courier_shipment.ncm_order_id,
@@ -232,6 +261,7 @@ def execute_ncm_dispatch(
                     is_reconciled=True,
                 )
             else:
+                _sync_dispatch_job(order_id, status='MANUAL_REVIEW_REQUIRED', last_error=order.ncm_dispatch_last_error)
                 return {
                     "status": "MANUAL_REVIEW_REQUIRED",
                     "error": order.ncm_dispatch_last_error or "Order requires manual admin review after ambiguous timeout.",
@@ -251,12 +281,14 @@ def execute_ncm_dispatch(
             order.ncm_dispatch_status = 'FAILED'
             order.ncm_dispatch_last_error = err_msg or "Validation failed."
             order.save(update_fields=['ncm_dispatch_status', 'ncm_dispatch_last_error'])
+            _sync_dispatch_job(order_id, status='FAILED', last_error=err_msg or "Validation failed.")
             return {"status": "VALIDATION_FAILED", "error": err_msg}
 
         # Transition to CREATING
         order.ncm_dispatch_status = 'CREATING'
         order.ncm_dispatch_last_attempt_at = timezone.now()
         order.save(update_fields=['ncm_dispatch_status', 'ncm_dispatch_last_attempt_at'])
+        _sync_dispatch_job(order_id, status='PROCESSING')
 
     # 2. Call external NCM API (outside database transaction to keep lock short)
     valid_branch = ncm_payload["branch"]
@@ -305,6 +337,7 @@ def execute_ncm_dispatch(
                         "Do not blindly retry without checking NCM portal or reconciling."
                     )
                     order.save(update_fields=['ncm_dispatch_status', 'ncm_dispatch_last_error'])
+                    _sync_dispatch_job(order_id, status='MANUAL_REVIEW_REQUIRED', last_error=order.ncm_dispatch_last_error)
                 return {"status": "MANUAL_REVIEW_REQUIRED", "error": order.ncm_dispatch_last_error}
         else:
             # Confirmed transient connection failure before sending payload
@@ -319,6 +352,13 @@ def execute_ncm_dispatch(
                 else:
                     order.ncm_dispatch_next_retry = None
                 order.save(update_fields=['ncm_dispatch_status', 'ncm_dispatch_attempts', 'ncm_dispatch_last_error', 'ncm_dispatch_next_retry'])
+                _sync_dispatch_job(
+                    order_id,
+                    status='FAILED',
+                    last_error=order.ncm_dispatch_last_error,
+                    attempts=order.ncm_dispatch_attempts,
+                    next_retry_at=order.ncm_dispatch_next_retry,
+                )
 
             # Bounded Celery retry if running within Celery worker
             if celery_task and order.ncm_dispatch_attempts < 3:
@@ -343,6 +383,13 @@ def execute_ncm_dispatch(
             order.ncm_dispatch_last_error = last_error
             order.ncm_dispatch_next_retry = None  # API errors are usually deterministic, do not auto retry
             order.save(update_fields=['ncm_dispatch_status', 'ncm_dispatch_attempts', 'ncm_dispatch_last_error', 'ncm_dispatch_next_retry'])
+            _sync_dispatch_job(
+                order_id,
+                status='FAILED',
+                last_error=last_error,
+                attempts=order.ncm_dispatch_attempts,
+                next_retry_at=None,
+            )
         return {"status": "FAILED", "error": last_error}
 
     # 3. Successful dispatch from NCM API
@@ -465,6 +512,8 @@ def _persist_successful_ncm_shipment(
         else:
             locked_order.save(update_fields=['ncm_dispatch_status', 'ncm_dispatch_last_error', 'ncm_dispatch_next_retry', 'updated_at'])
 
+        _sync_dispatch_job(target_pk, status='COMPLETED')
+
     # Send student notification
     from core.notification_service import NotificationService
     NotificationService._create_if_allowed(
@@ -492,26 +541,94 @@ def trigger_ncm_auto_dispatch(order_id: int) -> None:
     Strictly executed via transaction.on_commit() AFTER admin payment approval commits.
 
     Execution Strategy:
-    1. If Celery is configured and worker broker is accessible, queues via Celery task.
-    2. In eager/test mode (settings.CELERY_TASK_ALWAYS_EAGER=True), executes synchronously.
-    3. If Celery is not configured or fails to enqueue, falls back to a background daemon thread
-       so that the admin's HTTP response is NEVER blocked by slow external NCM HTTP requests.
+    1. Persists a durable database outbox record (NCMDispatchJob) for auditability & crash recovery.
+    2. If Celery is configured and running in eager mode (e.g. test runner), executes synchronously.
+    3. If Celery is in asynchronous mode, enqueues via Celery task.
+    4. Starts a background daemon thread as an immediate local worker fallback so dispatch
+       executes reliably even if no external Celery worker process is provisioned on Render.
     """
+    # 1. Create or ensure durable outbox record exists
+    try:
+        from marketplace.models import NCMDispatchJob
+        NCMDispatchJob.objects.get_or_create(
+            order_id=order_id,
+            status__in=['QUEUED', 'PROCESSING'],
+            defaults={'status': 'QUEUED'}
+        )
+    except Exception as exc:
+        logger.debug("NCMDispatchJob outbox persistence skipped: %s", exc)
+
+    # 2. Celery enqueue (in eager mode executes immediately)
+    is_eager = getattr(settings, 'CELERY_TASK_ALWAYS_EAGER', False)
     try:
         from marketplace.tasks import dispatch_order_courier_shipment_task
-        # In Celery eager mode (used in test runner) or standard Celery deployment
         dispatch_order_courier_shipment_task.delay(order_id)
-        logger.info("Enqueued Celery task for NCM courier dispatch for Order #%s", order_id)
+        logger.info("Enqueued Celery task for NCM courier dispatch for Order #%s (eager=%s)", order_id, is_eager)
     except Exception as exc:
         logger.warning(
             "Celery task dispatch unavailable for Order #%s (%s). Falling back to background daemon thread.",
             order_id, exc
         )
-        thread = threading.Thread(
-            target=execute_ncm_dispatch,
-            args=(order_id,),
-            daemon=True,
-            name=f"NCMAutoDispatch-Order-{order_id}",
-        )
-        thread.start()
+
+    # 3. If not eager mode, spawn background daemon thread to guarantee immediate dispatch
+    # on single-service deployments (e.g. Render Web Service without separate Celery worker)
+    if not is_eager:
+        try:
+            thread = threading.Thread(
+                target=execute_ncm_dispatch,
+                args=(order_id,),
+                daemon=True,
+                name=f"NCMAutoDispatch-Order-{order_id}",
+            )
+            thread.start()
+        except Exception as th_err:
+            logger.warning("Could not launch background dispatch thread for Order #%s: %s", order_id, th_err)
+
+
+def process_ncm_dispatch_queue(limit: int = 50) -> Dict[str, Any]:
+    """
+    Durable queue worker to drain and process queued or pending-retry NCM dispatches.
+    Uses select_for_update(skip_locked=True) to prevent race conditions across web/worker processes.
+    Enables automatic recovery from server restarts, network drops, or worker recycles.
+    """
+    from django.db.models import Q
+    now = timezone.now()
+    processed = 0
+    succeeded = 0
+    failed = 0
+
+    order_ids_to_process = []
+    try:
+        with transaction.atomic():
+            queued_orders = list(
+                Order.objects.filter(
+                    courier_shipment__isnull=True,
+                ).filter(
+                    Q(ncm_dispatch_status='QUEUED') |
+                    Q(ncm_dispatch_status='FAILED', ncm_dispatch_next_retry__lte=now)
+                ).select_for_update(skip_locked=True)[:limit]
+            )
+            for ord_obj in queued_orders:
+                order_ids_to_process.append(ord_obj.id)
+    except Exception as exc:
+        logger.warning("Could not lock queued orders for dispatch queue processing: %s", exc)
+        return {"processed": 0, "succeeded": 0, "failed": 0, "error": str(exc)}
+
+    for oid in order_ids_to_process:
+        try:
+            res = execute_ncm_dispatch(oid)
+            processed += 1
+            if res.get("status") in ("CREATED", "ALREADY_DISPATCHED"):
+                succeeded += 1
+            else:
+                failed += 1
+        except Exception as exc:
+            logger.error("Error executing queued NCM dispatch for Order #%s: %s", oid, exc)
+            failed += 1
+
+    return {
+        "processed": processed,
+        "succeeded": succeeded,
+        "failed": failed,
+    }
 

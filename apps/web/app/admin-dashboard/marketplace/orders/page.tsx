@@ -541,46 +541,99 @@ export default function MarketplaceOrdersPage() {
                   )}
                 </div>
 
-                {/* Dispatch & Payment Status Badges */}
-                <div className="flex flex-wrap items-center gap-2 bg-slate-50 p-2.5 rounded-lg border text-xs">
-                  <span className="font-semibold text-slate-500">Dispatch Status:</span>
-                  {viewOrder.courier_shipment || viewOrder.ncm_dispatch_status === 'CREATED' ? (
-                    <span className="px-2 py-0.5 rounded text-[11px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-200">
-                      CREATED
-                    </span>
-                  ) : viewOrder.ncm_dispatch_status === 'QUEUED' ? (
-                    <span className="px-2 py-0.5 rounded text-[11px] font-bold bg-blue-100 text-blue-800 border border-blue-200 flex items-center gap-1">
-                      <RefreshCw className="w-3 h-3 animate-spin" /> QUEUED FOR DISPATCH
-                    </span>
-                  ) : viewOrder.ncm_dispatch_status === 'CREATING' ? (
-                    <span className="px-2 py-0.5 rounded text-[11px] font-bold bg-indigo-100 text-indigo-800 border border-indigo-200 flex items-center gap-1">
-                      <Loader2 className="w-3 h-3 animate-spin" /> CREATING IN NCM...
-                    </span>
-                  ) : viewOrder.ncm_dispatch_status === 'FAILED' ? (
-                    <span className="px-2 py-0.5 rounded text-[11px] font-bold bg-rose-100 text-rose-800 border border-rose-200">
-                      DISPATCH FAILED
-                    </span>
-                  ) : viewOrder.ncm_dispatch_status === 'MANUAL_REVIEW_REQUIRED' ? (
-                    <span className="px-2 py-0.5 rounded text-[11px] font-bold bg-amber-100 text-amber-900 border border-amber-300">
-                      MANUAL REVIEW REQUIRED
-                    </span>
-                  ) : (
-                    <span className="px-2 py-0.5 rounded text-[11px] font-bold bg-slate-100 text-slate-600 border border-slate-200">
-                      NOT REQUESTED
-                    </span>
-                  )}
+                {/* Phase 18: Distinct Lifecycle & Dispatch Observability Dashboard */}
+                <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 text-xs space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 pb-2">
+                    <div className="flex items-center gap-2">
+                      <span className="font-bold text-slate-700">Lifecycle Status:</span>
+                      {(() => {
+                        const status = (viewOrder as any).dispatch_observability?.lifecycle_status || (viewOrder as any).lifecycle_status || 'PENDING_PAYMENT';
+                        const badgeStyles: Record<string, { bg: string, text: string, border: string, label: string }> = {
+                          PENDING_PAYMENT: { bg: 'bg-slate-100', text: 'text-slate-700', border: 'border-slate-300', label: 'PENDING PAYMENT' },
+                          PAYMENT_VERIFIED: { bg: 'bg-blue-100', text: 'text-blue-800', border: 'border-blue-300', label: 'PAYMENT VERIFIED' },
+                          DISPATCH_QUEUED: { bg: 'bg-indigo-100', text: 'text-indigo-800', border: 'border-indigo-300', label: 'DISPATCH QUEUED' },
+                          DISPATCH_PROCESSING: { bg: 'bg-sky-100', text: 'text-sky-800', border: 'border-sky-300', label: 'DISPATCH PROCESSING' },
+                          DISPATCH_FAILED: { bg: 'bg-rose-100', text: 'text-rose-800', border: 'border-rose-300', label: 'DISPATCH FAILED' },
+                          MANUAL_REVIEW_REQUIRED: { bg: 'bg-amber-100', text: 'text-amber-900', border: 'border-amber-400', label: 'MANUAL REVIEW REQUIRED' },
+                          NCM_ORDER_CREATED: { bg: 'bg-emerald-100', text: 'text-emerald-800', border: 'border-emerald-300', label: 'NCM ORDER CREATED' },
+                          IN_TRANSIT: { bg: 'bg-purple-100', text: 'text-purple-800', border: 'border-purple-300', label: 'IN TRANSIT' },
+                          DELIVERED: { bg: 'bg-teal-100', text: 'text-teal-800', border: 'border-teal-300', label: 'DELIVERED' },
+                          REMITTANCE_CONFIRMED: { bg: 'bg-green-100', text: 'text-green-900', border: 'border-green-400', label: 'REMITTANCE CONFIRMED' },
+                        };
+                        const defaultBadge = { bg: 'bg-slate-100', text: 'text-slate-700', border: 'border-slate-300', label: 'PENDING PAYMENT' };
+                        const s = badgeStyles[status] ?? defaultBadge;
+                        return (
+                          <span className={`px-2 py-0.5 rounded text-[11px] font-bold border ${s.bg} ${s.text} ${s.border}`}>
+                            {s.label}
+                          </span>
+                        );
+                      })()}
+                    </div>
+                    <div className="flex items-center gap-2 text-[11px] text-slate-500">
+                      <span>NCM Connection: <strong className={(viewOrder as any).dispatch_observability?.ncm_auth_status === 'connected' ? 'text-emerald-600' : 'text-slate-600'}>
+                        {((viewOrder as any).dispatch_observability?.ncm_auth_status || 'untested').toUpperCase()}
+                      </strong></span>
+                    </div>
+                  </div>
 
-                  <span className="text-slate-300">|</span>
-                  <span className="font-semibold text-slate-500">Payment:</span>
-                  <span className={`px-2 py-0.5 rounded text-[11px] font-bold border ${
-                    viewOrder.payment_status === 'PAID'
-                      ? 'bg-emerald-100 text-emerald-800 border-emerald-200'
-                      : viewOrder.payment_status === 'PARTIALLY_PAID'
-                      ? 'bg-amber-100 text-amber-800 border-amber-200'
-                      : 'bg-slate-100 text-slate-600 border-slate-200'
-                  }`}>
-                    {viewOrder.payment_status || 'UNPAID'} {viewOrder.is_cod ? '(15% Advance Verified)' : '(100% Prepaid Verified)'}
-                  </span>
+                  {/* Telemetry Grid */}
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-[11px]">
+                    <div className="bg-white p-2 rounded border border-slate-200">
+                      <div className="text-slate-400">Payment Status</div>
+                      <div className="font-semibold text-slate-800">
+                        {(viewOrder as any).dispatch_observability?.payment_verification_status || (viewOrder.payment_status === 'PAID' ? 'Verified (100%)' : viewOrder.payment_status === 'PARTIALLY_PAID' ? 'Verified (15% Advance)' : 'Unpaid')}
+                      </div>
+                    </div>
+                    <div className="bg-white p-2 rounded border border-slate-200">
+                      <div className="text-slate-400">Dispatch Job</div>
+                      <div className="font-semibold text-slate-800">
+                        {(viewOrder as any).dispatch_observability?.dispatch_job_status || viewOrder.ncm_dispatch_status}
+                      </div>
+                    </div>
+                    <div className="bg-white p-2 rounded border border-slate-200">
+                      <div className="text-slate-400">Queue Time</div>
+                      <div className="font-mono text-slate-700">
+                        {(viewOrder as any).dispatch_observability?.queue_timestamp ? new Date((viewOrder as any).dispatch_observability.queue_timestamp).toLocaleTimeString() : 'N/A'}
+                      </div>
+                    </div>
+                    <div className="bg-white p-2 rounded border border-slate-200">
+                      <div className="text-slate-400">Worker Exec Time</div>
+                      <div className="font-mono text-slate-700">
+                        {(viewOrder as any).dispatch_observability?.worker_execution_timestamp ? new Date((viewOrder as any).dispatch_observability.worker_execution_timestamp).toLocaleTimeString() : 'N/A'}
+                      </div>
+                    </div>
+                    <div className="bg-white p-2 rounded border border-slate-200">
+                      <div className="text-slate-400">NCM Order ID</div>
+                      <div className="font-mono font-semibold text-emerald-700">
+                        {viewOrder.courier_shipment?.ncm_order_id || (viewOrder as any).dispatch_observability?.ncm_order_id || 'Not created'}
+                      </div>
+                    </div>
+                    <div className="bg-white p-2 rounded border border-slate-200">
+                      <div className="text-slate-400">Tracking Reference</div>
+                      <div className="font-mono font-semibold text-slate-800">
+                        {viewOrder.courier_shipment?.tracking_id || (viewOrder as any).dispatch_observability?.tracking_reference || 'N/A'}
+                      </div>
+                    </div>
+                    <div className="bg-white p-2 rounded border border-slate-200">
+                      <div className="text-slate-400">Dispatch Attempts</div>
+                      <div className="font-semibold text-slate-800">
+                        {(viewOrder as any).dispatch_observability?.dispatch_attempt_count ?? viewOrder.ncm_dispatch_attempts ?? 0}
+                      </div>
+                    </div>
+                    <div className="bg-white p-2 rounded border border-slate-200">
+                      <div className="text-slate-400">Next Retry / Recon</div>
+                      <div className="text-slate-700 truncate" title={(viewOrder as any).dispatch_observability?.next_retry_status}>
+                        {(viewOrder as any).dispatch_observability?.next_retry_status || 'None'}
+                      </div>
+                    </div>
+                  </div>
+
+                  {(viewOrder as any).dispatch_observability?.last_failure_reason && (
+                    <div className="bg-rose-50 border border-rose-200 p-2 rounded text-[11px] text-rose-800">
+                      <span className="font-bold">Last Error: </span>
+                      <span className="font-mono">{(viewOrder as any).dispatch_observability.last_failure_reason}</span>
+                    </div>
+                  )}
                 </div>
 
                 {/* Ambiguous Timeout / Manual Review Card */}

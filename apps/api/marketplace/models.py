@@ -1,3 +1,4 @@
+import os
 from decimal import Decimal, ROUND_HALF_UP
 from django.conf import settings
 # pyrefly: ignore [missing-import]
@@ -1065,6 +1066,15 @@ class NCMConfiguration(models.Model):
     last_webhook_event = models.CharField(max_length=100, blank=True)
     last_webhook_error = models.TextField(blank=True)
 
+    # Branch Sync Telemetry (Phase 18)
+    branch_sync_source = models.CharField(
+        max_length=50,
+        default='STATIC_FALLBACK',
+        help_text="Source of active branches: LIVE_API, DATABASE_CACHE, or STATIC_FALLBACK."
+    )
+    last_branch_sync_at = models.DateTimeField(null=True, blank=True)
+    branch_record_count = models.IntegerField(default=0)
+
     updated_at = models.DateTimeField(auto_now=True)
     updated_by = models.ForeignKey(
         User,
@@ -1087,10 +1097,13 @@ class NCMConfiguration(models.Model):
         return obj
 
     def get_effective_base_url(self):
-        if self.custom_base_url:
+        # 1. Custom base URL override in database
+        if self.custom_base_url and self.custom_base_url.strip():
             url = self.custom_base_url.strip()
-        elif getattr(settings, 'NCM_BASE_URL', ''):
-            url = getattr(settings, 'NCM_BASE_URL', '').strip()
+        # 2. Explicit base URL override from environment variable (only if explicitly set in os.environ)
+        elif getattr(settings, 'NCM_EXPLICIT_BASE_URL', os.environ.get('NCM_BASE_URL', '')).strip():
+            url = getattr(settings, 'NCM_EXPLICIT_BASE_URL', os.environ.get('NCM_BASE_URL', '')).strip()
+        # 3. Environment matching (production vs demo) strictly derived from self.environment
         elif self.environment == 'production':
             url = 'https://portal.nepalcanmove.com/api/'
         else:
@@ -1100,7 +1113,10 @@ class NCMConfiguration(models.Model):
         return url
 
     def get_effective_token(self):
-        raw = self.custom_api_token or getattr(settings, 'NCM_API_TOKEN', '')
+        # Database custom token override takes precedence if set, otherwise Render/environment variable
+        raw = self.custom_api_token.strip() if self.custom_api_token else ''
+        if not raw:
+            raw = (os.environ.get('NCM_API_TOKEN') or getattr(settings, 'NCM_API_TOKEN', '')).strip()
         return clean_ncm_token(raw)
 
     def get_masked_token(self):
@@ -1112,11 +1128,12 @@ class NCMConfiguration(models.Model):
         return f"{token[:4]}****{token[-4:]}"
 
     def get_token_source(self):
-        if self.custom_api_token:
-            return 'database'
-        if getattr(settings, 'NCM_API_TOKEN', ''):
-            return 'environment'
-        return 'not_configured'
+        if self.custom_api_token and clean_ncm_token(self.custom_api_token):
+            return 'DATABASE'
+        env_tok = (os.environ.get('NCM_API_TOKEN') or getattr(settings, 'NCM_API_TOKEN', '')).strip()
+        if env_tok and clean_ncm_token(env_tok):
+            return 'ENVIRONMENT'
+        return 'NOT_CONFIGURED'
 
 
 class NCMWebhookEvent(models.Model):
@@ -1389,5 +1406,48 @@ class NCMBranchCoordinateAuditLog(models.Model):
 
     def __str__(self):
         return f"Coordinate change for {self.branch.name} at {self.created_at}"
+
+
+class NCMDispatchJob(models.Model):
+    """
+    Durable database-backed outbox queue for NCM automated courier shipments.
+    Guarantees persistence across web process restarts and worker recycles.
+    """
+    STATUS_CHOICES = (
+        ('QUEUED', 'Queued for Dispatch'),
+        ('PROCESSING', 'Processing in Worker'),
+        ('COMPLETED', 'Shipment Created Successfully'),
+        ('FAILED', 'Dispatch Failed'),
+        ('MANUAL_REVIEW_REQUIRED', 'Manual Review Required'),
+    )
+
+    order = models.ForeignKey(
+        Order,
+        on_delete=models.CASCADE,
+        related_name='ncm_dispatch_jobs',
+        help_text="Order associated with this dispatch job."
+    )
+    status = models.CharField(
+        max_length=30,
+        choices=STATUS_CHOICES,
+        default='QUEUED',
+        db_index=True,
+    )
+    attempts = models.PositiveIntegerField(default=0)
+    max_attempts = models.PositiveIntegerField(default=3)
+    last_error = models.TextField(blank=True)
+    last_attempt_at = models.DateTimeField(null=True, blank=True)
+    next_retry_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['created_at']
+        indexes = [
+            models.Index(fields=['status', 'next_retry_at']),
+        ]
+
+    def __str__(self):
+        return f"DispatchJob #{self.id} (Order #{self.order_id} - {self.status})"
 
 

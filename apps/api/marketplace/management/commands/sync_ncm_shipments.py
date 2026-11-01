@@ -152,26 +152,14 @@ class Command(BaseCommand):
             )
         )
 
-        # Process any orders due for automatic dispatch retry
-        from marketplace.models import Order
-        from marketplace.dispatch_service import execute_ncm_dispatch
-
-        pending_retries = list(
-            Order.objects.filter(
-                ncm_dispatch_status='FAILED',
-                ncm_dispatch_next_retry__lte=timezone.now(),
-                courier_shipment__isnull=True,
-            )[:20]
-        )
-        if pending_retries:
-            self.stdout.write(f"Processing {len(pending_retries)} pending automated NCM dispatch retries...")
-            for pending_order in pending_retries:
-                try:
-                    res = execute_ncm_dispatch(pending_order.id)
-                    if res.get("status") == "CREATED":
-                        self.stdout.write(self.style.SUCCESS(f"Order #{pending_order.id} retry succeeded: NCM #{res.get('ncm_order_id')}"))
-                    else:
-                        self.stdout.write(self.style.WARNING(f"Order #{pending_order.id} retry result: {res.get('status')} - {res.get('error')}"))
-                except Exception as exc:
-                    logger.warning("Error retrying NCM dispatch for Order #%s: %s", pending_order.id, exc)
+        # Process any queued or pending retry dispatches
+        from marketplace.dispatch_service import process_ncm_dispatch_queue
+        dispatch_res = process_ncm_dispatch_queue(limit=25)
+        if dispatch_res.get('processed', 0) > 0:
+            self.stdout.write(
+                self.style.SUCCESS(
+                    f"Processed {dispatch_res['processed']} queued/pending dispatches "
+                    f"({dispatch_res['succeeded']} succeeded, {dispatch_res['failed']} failed)."
+                )
+            )
 

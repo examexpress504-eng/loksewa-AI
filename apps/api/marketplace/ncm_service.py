@@ -418,6 +418,7 @@ def discover_nearest_ncm_branches(
     mun_matches = [b for b in processed_branches if b["coverage_type"] == "local_level"]
     dist_matches = [b for b in processed_branches if b["coverage_type"] == "district"]
     nearby_matches = [b for b in processed_branches if b["coverage_type"] == "cross_district_nearby"]
+    regional_matches = [b for b in processed_branches if b["coverage_type"] == "regional"]
 
     # Sorting helper:
     # 1. Serviceable first (is_serviceable=True -> 0, False -> 1)
@@ -435,6 +436,11 @@ def discover_nearest_ncm_branches(
             exact_mun_rank = 0 if is_token_boundary_match(stem_mun, b_mun_str) else 1
         return (serviceable_rank, tole_rank, exact_mun_rank, dist_val, b.get("name", ""))
 
+    mun_matches.sort(key=lambda b: sort_key(b, is_mun_pool=True))
+    dist_matches.sort(key=lambda b: sort_key(b, is_mun_pool=False))
+    nearby_matches.sort(key=lambda b: sort_key(b, is_mun_pool=False))
+    regional_matches.sort(key=lambda b: sort_key(b, is_mun_pool=False))
+
     delivery_anchor = {
         "latitude": student_lat,
         "longitude": student_lon,
@@ -444,115 +450,92 @@ def discover_nearest_ncm_branches(
         "province": raw_prov,
     }
 
-    # Priority 1: Local Level
-    if mun_matches:
-        mun_matches.sort(key=lambda b: sort_key(b, is_mun_pool=True))
-        # Select first serviceable candidate as recommended
-        recommended = None
-        for b in mun_matches:
-            if b.get("is_serviceable", True):
-                recommended = b
-                break
-        if not recommended and mun_matches:
-            # If all are unserviceable, do not recommend unserviceable
-            recommended = None
+    # Strict multi-tiered hierarchy:
+    # 1. Exact local-level matches first.
+    # 2. All relevant district branches second.
+    # 3. Verified serviceable neighboring districts third.
+    # 4. Wider network alternatives last.
+    # Delivery serviceability is validated separately from proximity:
+    # Serviceable branches strictly outrank unserviceable ones, and unserviceable
+    # branches are NEVER recommended or auto-selected.
+    serviceable_mun = [b for b in mun_matches if b.get("is_serviceable", True)]
+    serviceable_dist = [b for b in dist_matches if b.get("is_serviceable", True)]
+    serviceable_nearby = [b for b in nearby_matches if b.get("is_serviceable", True)]
+    serviceable_regional = [b for b in regional_matches if b.get("is_serviceable", True)]
+    unserviceable_pool = [
+        b for b in mun_matches + dist_matches + nearby_matches + regional_matches
+        if not b.get("is_serviceable", True)
+    ]
 
-        for idx, b in enumerate(mun_matches):
+    recommended = None
+    match_priority = 0
+    match_type = "none"
+    message = "No NCM branch was found for your local level or district. Courier delivery is currently unavailable for this location."
+
+    if serviceable_mun:
+        recommended = serviceable_mun[0]
+        match_priority = 1
+        match_type = "municipality"
+        message = f"Found {len(mun_matches)} NCM branch(es) serving your local level."
+        ordered_suggestions = mun_matches + serviceable_dist + serviceable_nearby + serviceable_regional
+    elif serviceable_dist:
+        recommended = serviceable_dist[0]
+        match_priority = 2
+        match_type = "district"
+        message = "No NCM branch was found for your local level. Here are the available NCM branches serving your district."
+        ordered_suggestions = dist_matches + serviceable_nearby + serviceable_regional
+    elif serviceable_nearby and allow_nearby:
+        recommended = serviceable_nearby[0]
+        match_priority = 3
+        match_type = "nearby"
+        message = "No NCM branch was found for your local level or district. Showing nearest available NCM branches in neighboring districts."
+        ordered_suggestions = nearby_matches + serviceable_regional
+    elif mun_matches:
+        # All local matches were unserviceable
+        match_priority = 1
+        match_type = "municipality"
+        message = "Branches exist for your local level but are currently unserviceable."
+        ordered_suggestions = mun_matches + dist_matches + nearby_matches
+    elif dist_matches:
+        # All district matches were unserviceable
+        match_priority = 2
+        match_type = "district"
+        message = "Branches exist for your district but are currently unserviceable."
+        ordered_suggestions = dist_matches + nearby_matches
+    elif nearby_matches:
+        match_priority = 3 if allow_nearby else 0
+        match_type = "nearby" if allow_nearby else "none"
+        message = (
+            "No NCM branch was found for your local level or district. Showing nearest available NCM branches in neighboring districts."
+            if allow_nearby else
+            "No NCM branch was found for your local level or district. Courier delivery is currently unavailable for this location."
+        )
+        ordered_suggestions = nearby_matches if allow_nearby else []
+    else:
+        ordered_suggestions = []
+
+    # Deduplicate while preserving strict tier ordering
+    seen_codes = set()
+    deduped_suggestions = []
+    for b in ordered_suggestions:
+        code_key = str(b.get("code") or b.get("pk") or b.get("name") or "").strip().lower()
+        if code_key and code_key not in seen_codes:
+            seen_codes.add(code_key)
             b["is_recommended"] = (recommended is not None and b.get("code") == recommended.get("code"))
+            deduped_suggestions.append(b)
 
-        auto_selected = recommended["name"] if recommended else None
+    auto_selected = recommended["name"] if recommended else None
 
-        return {
-            "match_priority": 1,
-            "match_type": "municipality",
-            "message": f"Found {len(mun_matches)} NCM branch(es) serving your local level.",
-            "search_municipality": raw_mun,
-            "search_district": raw_dist,
-            "recommended_branch": recommended,
-            "suggested_branches": mun_matches[:max_results],
-            "auto_selected": auto_selected,
-            "delivery_anchor": delivery_anchor,
-        }
-
-    # Priority 2: District Hub Fallback
-    if dist_matches:
-        dist_matches.sort(key=lambda b: sort_key(b, is_mun_pool=False))
-        recommended = None
-        for b in dist_matches:
-            if b.get("is_serviceable", True):
-                recommended = b
-                break
-
-        for idx, b in enumerate(dist_matches):
-            b["is_recommended"] = (recommended is not None and b.get("code") == recommended.get("code"))
-
-        auto_selected = recommended["name"] if recommended else None
-
-        return {
-            "match_priority": 2,
-            "match_type": "district",
-            "message": "No NCM branch was found for your local level. Here are the available NCM branches serving your district.",
-            "search_municipality": raw_mun,
-            "search_district": raw_dist,
-            "recommended_branch": recommended,
-            "suggested_branches": dist_matches[:max_results],
-            "auto_selected": auto_selected,
-            "delivery_anchor": delivery_anchor,
-        }
-
-    # Priority 3: Cross-District Nearby Discovery
-    if nearby_matches:
-        nearby_matches.sort(key=lambda b: sort_key(b, is_mun_pool=False))
-        recommended = None
-        for b in nearby_matches:
-            if b.get("is_serviceable", True):
-                recommended = b
-                break
-
-        for idx, b in enumerate(nearby_matches):
-            b["is_recommended"] = (recommended is not None and b.get("code") == recommended.get("code"))
-
-        auto_selected = recommended["name"] if recommended else None
-
-        if allow_nearby:
-            return {
-                "match_priority": 3,
-                "match_type": "nearby",
-                "message": "No NCM branch was found for your local level or district. Showing nearest available NCM branches in neighboring districts.",
-                "search_municipality": raw_mun,
-                "search_district": raw_dist,
-                "recommended_branch": recommended,
-                "suggested_branches": nearby_matches[:max_results],
-                "nearby_branches": nearby_matches[:max_results],
-                "auto_selected": auto_selected,
-                "delivery_anchor": delivery_anchor,
-            }
-        else:
-            # Without allow_nearby flag, honor strict district boundary
-            return {
-                "match_priority": 0,
-                "match_type": "none",
-                "message": "No NCM branch was found for your local level or district. Courier delivery is currently unavailable for this location.",
-                "search_municipality": raw_mun,
-                "search_district": raw_dist,
-                "recommended_branch": None,
-                "suggested_branches": [],
-                "nearby_branches": nearby_matches[:max_results],
-                "auto_selected": None,
-                "delivery_anchor": delivery_anchor,
-            }
-
-    # No Match
     return {
-        "match_priority": 0,
-        "match_type": "none",
-        "message": "No NCM branch was found for your local level or district. Courier delivery is currently unavailable for this location.",
+        "match_priority": match_priority,
+        "match_type": match_type,
+        "message": message,
         "search_municipality": raw_mun,
         "search_district": raw_dist,
-        "recommended_branch": None,
-        "suggested_branches": [],
-        "nearby_branches": [],
-        "auto_selected": None,
+        "recommended_branch": recommended,
+        "suggested_branches": deduped_suggestions[:max_results],
+        "nearby_branches": nearby_matches[:max_results],
+        "auto_selected": auto_selected,
         "delivery_anchor": delivery_anchor,
     }
 
@@ -618,17 +601,14 @@ class NCMService:
         from .models import clean_ncm_token
         self.api_token = clean_ncm_token(raw_token)
 
-        if base_url is not None:
+        if base_url is not None and base_url.strip():
             raw_base = base_url.strip()
-        elif config and config.get_effective_base_url():
-            raw_base = config.get_effective_base_url().strip()
+        elif config:
+            raw_base = config.get_effective_base_url()
+        elif getattr(settings, 'NCM_EXPLICIT_BASE_URL', os.environ.get('NCM_BASE_URL', '')).strip():
+            raw_base = getattr(settings, 'NCM_EXPLICIT_BASE_URL', os.environ.get('NCM_BASE_URL', '')).strip()
         else:
-            raw_base = getattr(settings, "NCM_BASE_URL", "").strip()
-
-        if not raw_base:
             env = getattr(settings, "NCM_ENVIRONMENT", "demo").lower()
-            if config:
-                env = config.environment.lower()
             if env == "production":
                 raw_base = "https://portal.nepalcanmove.com/api/"
             else:
@@ -683,6 +663,9 @@ class NCMService:
                 "error": error_msg,
                 "latency_ms": None,
                 "environment": config.environment if config else "unknown",
+                "base_url": self.base_url,
+                "token_source": config.get_token_source() if config else "NOT_CONFIGURED",
+                "masked_token": "",
             }
 
         try:
@@ -700,6 +683,8 @@ class NCMService:
                 "branch_count": len(branches),
                 "environment": config.environment if config else "demo",
                 "base_url": self.base_url,
+                "token_source": config.get_token_source() if config else ("ENVIRONMENT" if self.api_token else "NOT_CONFIGURED"),
+                "masked_token": config.get_masked_token() if config else (f"{self.api_token[:4]}****{self.api_token[-4:]}" if len(self.api_token) > 8 else "****"),
                 "default_origin_branch": self.default_origin_branch,
             }
         except Exception as exc:
@@ -721,6 +706,8 @@ class NCMService:
                 "latency_ms": latency_ms,
                 "environment": config.environment if config else "unknown",
                 "base_url": self.base_url,
+                "token_source": config.get_token_source() if config else ("ENVIRONMENT" if self.api_token else "NOT_CONFIGURED"),
+                "masked_token": config.get_masked_token() if config else (f"{self.api_token[:4]}****{self.api_token[-4:]}" if len(self.api_token) > 8 else "****"),
             }
 
     def is_configured(self) -> bool:
@@ -788,6 +775,21 @@ class NCMService:
 
                 # Check for HTTP errors
                 if response.status_code >= 400:
+                    # If public endpoint (e.g. branches) gets 401 due to invalid token, retry without Authorization header
+                    if response.status_code == 401 and "branches" in endpoint:
+                        logger.info("NCM token rejected on branches endpoint. Retrying with public headers without token.")
+                        headers_public = {k: v for k, v in headers.items() if k.lower() != "authorization"}
+                        response_pub = self._session.request(
+                            method=method_upper,
+                            url=url,
+                            headers=headers_public,
+                            params=params,
+                            json=json_data,
+                            timeout=self.timeout,
+                        )
+                        if response_pub.status_code < 400:
+                            return response_pub
+
                     # Do not retry 4xx client errors
                     if 400 <= response.status_code < 500:
                         logger.warning(
@@ -872,22 +874,23 @@ class NCMService:
     # 1. BRANCHES (GET /v2/branches)
     # --------------------------------------------------------------------------
 
-    def _get_fallback_or_seeded_branches(self) -> List[Dict[str, Any]]:
+    def _get_fallback_or_seeded_branches_with_source(self) -> Tuple[List[Dict[str, Any]], str]:
         """
-        Guarantees that a complete, verified branch list is always returned.
-        1. Checks in-memory cache
-        2. Checks Redis/Django cache
-        3. Queries active DB NCMBranchRecord
-        4. If DB is empty, auto-seeds with STANDARD_NCM_BRANCH_CATALOG into DB, caches, and returns.
+        Guarantees that a complete branch list is always returned, tracking data provenance:
+        - Checks in-memory cache
+        - Checks Redis/Django cache
+        - Queries active DB NCMBranchRecord (DATABASE_CACHE)
+        - If DB is empty, auto-seeds with STANDARD_NCM_BRANCH_CATALOG into DB, caches, and returns (STATIC_FALLBACK).
+        Never clears or overwrites existing valid DB records on failure.
         """
-        if NCMService._fallback_branches_cache:
-            return NCMService._fallback_branches_cache
+        if NCMService._fallback_branches_cache and len(NCMService._fallback_branches_cache) > 0:
+            return NCMService._fallback_branches_cache, "DATABASE_CACHE"
 
         try:
             stale = cache.get(self.BRANCHES_CACHE_KEY)
             if stale and isinstance(stale, list) and len(stale) > 0:
                 NCMService._fallback_branches_cache = stale
-                return stale
+                return stale, "DATABASE_CACHE"
         except Exception:
             pass
 
@@ -917,11 +920,11 @@ class NCMService:
                     cache.set(self.BRANCHES_CACHE_KEY, db_branches, timeout=self.BRANCHES_CACHE_TTL)
                 except Exception:
                     pass
-                return db_branches
+                return db_branches, "DATABASE_CACHE"
         except Exception as db_err:
-            logger.warning("Database branch fallback failed: %s", db_err)
+            logger.warning("Database branch fallback lookup failed: %s", db_err)
 
-        # DB is empty or failed: auto-seed from authoritative STANDARD_NCM_BRANCH_CATALOG
+        # DB is completely empty or failed: auto-seed from authoritative STANDARD_NCM_BRANCH_CATALOG
         try:
             from .nepal_geography import STANDARD_NCM_BRANCH_CATALOG
             self.sync_branches_to_db(STANDARD_NCM_BRANCH_CATALOG)
@@ -930,50 +933,126 @@ class NCMService:
                 cache.set(self.BRANCHES_CACHE_KEY, STANDARD_NCM_BRANCH_CATALOG, timeout=self.BRANCHES_CACHE_TTL)
             except Exception:
                 pass
-            return list(STANDARD_NCM_BRANCH_CATALOG)
+            return list(STANDARD_NCM_BRANCH_CATALOG), "STATIC_FALLBACK"
         except Exception as seed_err:
             logger.error("Auto-seeding branches from standard catalog failed: %s", seed_err)
-            return []
+            return [], "STATIC_FALLBACK"
 
-    def get_branches(self, force_refresh: bool = False) -> List[Dict[str, Any]]:
+    def _get_fallback_or_seeded_branches(self) -> List[Dict[str, Any]]:
+        branches, _ = self._get_fallback_or_seeded_branches_with_source()
+        return branches
+
+    def get_branches(
+        self,
+        force_refresh: bool = False,
+        return_meta: bool = False
+    ) -> Union[List[Dict[str, Any]], Tuple[List[Dict[str, Any]], Dict[str, Any]]]:
         """
         Fetch available NCM branches with district and covered areas.
-        Utilizes Django cache with a 24-hour TTL and in-memory fallback.
-        Guaranteed to never crash or return empty.
+        Supports complete live API pagination (following 'next' or page index),
+        removes arbitrary 30-record limits, and synchronizes the catalog into NCMBranchRecord.
+        
+        Guarantees:
+        - Never reports static or cached data as live API data.
+        - Preserves existing successful catalog if a live refresh fails.
+        - Returns provenance metadata: LIVE_API, DATABASE_CACHE, or STATIC_FALLBACK.
         """
+        config = None
+        try:
+            from .models import NCMConfiguration
+            config = NCMConfiguration.get_settings()
+        except Exception:
+            pass
+
         if not force_refresh:
             try:
                 cached_branches = cache.get(self.BRANCHES_CACHE_KEY)
                 if cached_branches and isinstance(cached_branches, list) and len(cached_branches) > 0:
-                    return cached_branches
+                    meta = {
+                        "source": "DATABASE_CACHE",
+                        "last_synced_at": config.last_branch_sync_at.isoformat() if config and config.last_branch_sync_at else None,
+                        "count": len(cached_branches),
+                    }
+                    return (cached_branches, meta) if return_meta else cached_branches
             except Exception as e:
                 logger.warning("Cache access error during NCM get_branches: %s", e)
 
-        if not self.is_configured():
-            logger.info("NCM API credentials not configured; serving verified local branch catalog.")
-            return self._get_fallback_or_seeded_branches()
+        if not self.base_url and not self.is_configured():
+            logger.info("NCM API base URL not configured; serving verified local branch catalog.")
+            branches, source = self._get_fallback_or_seeded_branches_with_source()
+            meta = {
+                "source": source,
+                "last_synced_at": config.last_branch_sync_at.isoformat() if config and config.last_branch_sync_at else None,
+                "count": len(branches),
+            }
+            return (branches, meta) if return_meta else branches
 
-        # Make API call
+        # Make Live API call with complete pagination support
         try:
-            response = self._execute_request(
-                method="GET",
-                endpoint="v2/branches",
-                allow_retries=True,
-            )
-            try:
-                data = response.json()
-            except ValueError as exc:
-                raise NCMAPIError(
-                    f"Invalid JSON returned from NCM branches API: {response.text[:200]}",
-                    status_code=response.status_code,
-                    response_body=response.text,
-                ) from exc
+            all_branches: List[Dict[str, Any]] = []
+            page_num = 1
+            max_pages = 50
+            next_url: Optional[str] = "v2/branches"
 
-            if not isinstance(data, list):
-                if isinstance(data, dict) and "results" in data and isinstance(data["results"], list):
-                    data = data["results"]
-                elif isinstance(data, dict) and "data" in data and isinstance(data["data"], list):
-                    data = data["data"]
+            while next_url and page_num <= max_pages:
+                # If next_url is absolute with base_url, strip to relative endpoint
+                endpoint = next_url
+                if endpoint.startswith(self.base_url):
+                    endpoint = endpoint[len(self.base_url):]
+                elif endpoint.startswith("http://") or endpoint.startswith("https://"):
+                    # Use full URL if different host, else relative
+                    pass
+
+                # If first page and clean endpoint, request higher limit if supported
+                params = None
+                if page_num == 1 and "?" not in endpoint:
+                    params = {"page_size": 250, "limit": 250}
+
+                response = self._execute_request(
+                    method="GET",
+                    endpoint=endpoint,
+                    params=params,
+                    allow_retries=True,
+                )
+
+                try:
+                    data = response.json()
+                except ValueError as exc:
+                    raise NCMAPIError(
+                        f"Invalid JSON returned from NCM branches API: {response.text[:200]}",
+                        status_code=response.status_code,
+                        response_body=response.text,
+                    ) from exc
+
+                page_branches: List[Dict[str, Any]] = []
+                next_url = None
+
+                if isinstance(data, list):
+                    # Flat unpaginated list
+                    page_branches = data
+                    next_url = None
+                elif isinstance(data, dict):
+                    if "results" in data and isinstance(data["results"], list):
+                        page_branches = data["results"]
+                        next_url = data.get("next")
+                    elif "data" in data and isinstance(data["data"], list):
+                        page_branches = data["data"]
+                        next_url = data.get("next")
+                    elif "branches" in data and isinstance(data["branches"], list):
+                        page_branches = data["branches"]
+                        next_url = data.get("next")
+                    else:
+                        raise NCMAPIError(
+                            f"Expected branch list from NCM, received unexpected format: {list(data.keys())}",
+                            status_code=response.status_code,
+                            response_body=data,
+                        )
+
+                    # If next_url not provided, check if total count indicates more items exist
+                    total_count = data.get("count") or data.get("total")
+                    if not next_url and total_count and (len(all_branches) + len(page_branches) < total_count) and len(page_branches) > 0:
+                        page_num += 1
+                        next_url = f"v2/branches?page={page_num}"
                 else:
                     raise NCMAPIError(
                         f"Expected branch list from NCM, received unexpected type: {type(data)}",
@@ -981,34 +1060,80 @@ class NCMService:
                         response_body=data,
                     )
 
+                all_branches.extend(page_branches)
+                if not next_url:
+                    break
+                page_num += 1
+
+            if not all_branches:
+                # Live API returned empty list: preserve existing valid DB records
+                logger.warning("NCM branch live API returned empty branch list. Preserving previous catalog.")
+                branches, source = self._get_fallback_or_seeded_branches_with_source()
+                meta = {
+                    "source": source,
+                    "last_synced_at": config.last_branch_sync_at.isoformat() if config and config.last_branch_sync_at else None,
+                    "count": len(branches),
+                }
+                return (branches, meta) if return_meta else branches
+
             # Store in Django cache and in-memory fallback
             try:
-                cache.set(self.BRANCHES_CACHE_KEY, data, timeout=self.BRANCHES_CACHE_TTL)
+                cache.set(self.BRANCHES_CACHE_KEY, all_branches, timeout=self.BRANCHES_CACHE_TTL)
             except Exception as e:
                 logger.warning("Failed to store NCM branches in cache: %s", e)
 
-            NCMService._fallback_branches_cache = data
-            logger.info("Successfully fetched and cached %d NCM branches", len(data))
+            NCMService._fallback_branches_cache = all_branches
+            logger.info("Successfully fetched %d NCM branches from LIVE_API across %d page(s)", len(all_branches), page_num)
 
-            # Synchronize to persistent database models
-            self.sync_branches_to_db(data)
+            # Synchronize to persistent database models without creating duplicates
+            self.sync_branches_to_db(all_branches)
 
-            return data
+            now = timezone.now()
+            if config:
+                config.branch_sync_source = 'LIVE_API'
+                config.last_branch_sync_at = now
+                config.branch_record_count = len(all_branches)
+                config.save(update_fields=['branch_sync_source', 'last_branch_sync_at', 'branch_record_count'])
+
+            meta = {
+                "source": "LIVE_API",
+                "last_synced_at": now.isoformat(),
+                "count": len(all_branches),
+            }
+            return (all_branches, meta) if return_meta else all_branches
 
         except Exception as exc:
             logger.warning(
-                "NCM branch fetch failed (%s). Falling back to local branch catalog.",
+                "NCM branch live API fetch failed (%s). Preserving existing database catalog.",
                 exc,
             )
-            return self._get_fallback_or_seeded_branches()
+            branches, source = self._get_fallback_or_seeded_branches_with_source()
+            meta = {
+                "source": source,
+                "last_synced_at": config.last_branch_sync_at.isoformat() if config and config.last_branch_sync_at else None,
+                "count": len(branches),
+                "sync_error": str(exc),
+            }
+            return (branches, meta) if return_meta else branches
 
-    def sync_branches_to_db(self, branches: List[Dict[str, Any]]) -> None:
+    def sync_branches_to_db(self, branches: List[Dict[str, Any]]) -> int:
         """
         Synchronizes branch records from NCM API into persistent NCMBranchRecord models.
         Preserves admin-verified coordinates without overwriting them.
+        Optimized with in-memory map and bulk operations for sub-second database synchronization.
         """
+        synced_count = 0
         try:
             from .models import NCMBranchRecord
+            from django.db import transaction
+
+            existing_records = {r.code.strip(): r for r in NCMBranchRecord.objects.all() if r.code}
+            existing_names = {r.name.strip().lower(): r for r in existing_records.values() if r.name}
+
+            to_create = []
+            to_update = []
+            now = timezone.now()
+
             for b in branches:
                 name = str(b.get("name") or "").strip()
                 if not name:
@@ -1027,22 +1152,33 @@ class NCMService:
 
                 b_lat = b.get("latitude")
                 b_lon = b.get("longitude")
-                b_src = b.get("coordinate_source")
+                # Parse geocode string e.g. "28.066032, 83.247817"
+                geocode = b.get("geocode")
+                if b_lat is None and geocode and isinstance(geocode, str) and "," in geocode:
+                    try:
+                        pts = geocode.split(",")
+                        b_lat = float(pts[0].strip())
+                        b_lon = float(pts[1].strip())
+                    except (ValueError, IndexError):
+                        pass
+
+                b_src = b.get("coordinate_source") or ("API" if b_lat is not None else "UNVERIFIED")
                 b_ver = bool(b.get("is_coordinate_verified", False))
 
-                rec = NCMBranchRecord.objects.filter(code=code).first()
+                rec = existing_records.get(code) or existing_names.get(name.lower())
                 if not rec:
                     if b_lat is not None and b_lon is not None:
                         c_lat, c_lon = b_lat, b_lon
-                        coord_src = b_src or 'ADMIN_VERIFIED'
+                        coord_src = b_src
                         is_ver = b_ver
                     else:
                         c_lat, c_lon, c_src, _ = get_municipality_centroid(mun or name, dist, prov)
-                        coord_src = 'UNVERIFIED'
+                        coord_src = "UNVERIFIED"
                         is_ver = False
                         if c_lat is not None:
-                            coord_src = 'MUNICIPALITY_CENTROID' if c_src == 'municipality_centroid' else 'DISTRICT_CENTROID'
-                    NCMBranchRecord.objects.create(
+                            coord_src = "MUNICIPALITY_CENTROID" if c_src == "municipality_centroid" else "DISTRICT_CENTROID"
+
+                    to_create.append(NCMBranchRecord(
                         code=code,
                         name=name,
                         district_name=dist,
@@ -1055,36 +1191,53 @@ class NCMService:
                         longitude=c_lon,
                         coordinate_source=coord_src,
                         is_coordinate_verified=is_ver,
-                        is_serviceable=bool(b.get('is_serviceable', True)),
-                        last_synced_at=timezone.now(),
-                    )
+                        is_serviceable=bool(b.get("is_serviceable", True)),
+                        is_active=True,
+                        last_synced_at=now,
+                    ))
                 else:
+                    rec.code = code
                     rec.name = name
-                    rec.district_name = dist
-                    rec.province_name = prov
-                    rec.municipality = mun
-                    rec.address = addr
-                    rec.contact_number = contact
-                    rec.areas_covered = raw_cov
-                    if 'is_serviceable' in b:
-                        rec.is_serviceable = bool(b['is_serviceable'])
-                    rec.last_synced_at = timezone.now()
+                    rec.district_name = dist or rec.district_name
+                    rec.province_name = prov or rec.province_name
+                    rec.municipality = mun or rec.municipality
+                    rec.address = addr or rec.address
+                    rec.contact_number = contact or rec.contact_number
+                    if raw_cov:
+                        rec.areas_covered = raw_cov
+                    if "is_serviceable" in b:
+                        rec.is_serviceable = bool(b["is_serviceable"])
+                    rec.is_active = True
+                    rec.last_synced_at = now
 
-                    # Enrich coordinates if missing or provided
-                    if b_lat is not None and b_lon is not None and (not rec.has_valid_coordinates or b_ver):
-                        rec.latitude = b_lat
-                        rec.longitude = b_lon
-                        rec.coordinate_source = b_src or 'ADMIN_VERIFIED'
-                        rec.is_coordinate_verified = b_ver
-                    elif not rec.is_coordinate_verified and rec.coordinate_source != 'ADMIN_VERIFIED' and not rec.has_valid_coordinates:
-                        c_lat, c_lon, c_src, _ = get_municipality_centroid(mun or name, dist, prov)
-                        if c_lat is not None:
-                            rec.latitude = c_lat
-                            rec.longitude = c_lon
-                            rec.coordinate_source = 'MUNICIPALITY_CENTROID' if c_src == 'municipality_centroid' else 'DISTRICT_CENTROID'
-                    rec.save()
+                    if not rec.is_coordinate_verified and rec.coordinate_source != "ADMIN_VERIFIED":
+                        if b_lat is not None and b_lon is not None:
+                            rec.latitude = b_lat
+                            rec.longitude = b_lon
+                            rec.coordinate_source = b_src
+                            rec.is_coordinate_verified = b_ver
+                        elif not rec.has_valid_coordinates:
+                            c_lat, c_lon, c_src, _ = get_municipality_centroid(mun or name, dist, prov)
+                            if c_lat is not None:
+                                rec.latitude = c_lat
+                                rec.longitude = c_lon
+                                rec.coordinate_source = "MUNICIPALITY_CENTROID" if c_src == "municipality_centroid" else "DISTRICT_CENTROID"
+                    to_update.append(rec)
+
+            with transaction.atomic():
+                if to_create:
+                    NCMBranchRecord.objects.bulk_create(to_create, batch_size=250)
+                if to_update:
+                    NCMBranchRecord.objects.bulk_update(
+                        to_update,
+                        fields=["code", "name", "district_name", "province_name", "municipality", "address", "contact_number", "areas_covered", "latitude", "longitude", "coordinate_source", "is_coordinate_verified", "is_serviceable", "is_active", "last_synced_at"],
+                        batch_size=250
+                    )
+            synced_count = len(to_create) + len(to_update)
+            logger.info("Successfully synced %d branches (%d created, %d updated)", synced_count, len(to_create), len(to_update))
         except Exception as e:
             logger.warning("Failed to synchronize NCM branches to DB: %s", e)
+        return synced_count
 
 
     # --------------------------------------------------------------------------

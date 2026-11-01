@@ -629,10 +629,10 @@ class OrderSerializer(serializers.ModelSerializer):
 
     payment_mode = serializers.CharField(source='payment_method_type', read_only=True)
     final_total = serializers.SerializerMethodField()
-
     latest_payment_submission = serializers.SerializerMethodField()
-
     can_retry_payment = serializers.SerializerMethodField()
+    lifecycle_status = serializers.SerializerMethodField()
+    dispatch_observability = serializers.SerializerMethodField()
 
     class Meta:
 
@@ -710,6 +710,86 @@ class OrderSerializer(serializers.ModelSerializer):
                 return False
 
         return True
+
+    def get_lifecycle_status(self, obj) -> str:
+        """
+        Computes distinct high-level order & courier lifecycle status:
+        PENDING_PAYMENT, PAYMENT_VERIFIED, DISPATCH_QUEUED, DISPATCH_PROCESSING,
+        DISPATCH_FAILED, MANUAL_REVIEW_REQUIRED, NCM_ORDER_CREATED, IN_TRANSIT,
+        DELIVERED, REMITTANCE_CONFIRMED.
+        """
+        shipment = getattr(obj, 'courier_shipment', None)
+        if obj.is_cod and shipment and obj.status == 'DELIVERED':
+            remittance = getattr(obj, 'cod_remittance', None)
+            if (remittance and remittance.status == 'VERIFIED') or obj.payment_status == 'PAID':
+                return 'REMITTANCE_CONFIRMED'
+            return 'DELIVERED'
+
+        if shipment:
+            if obj.status == 'DELIVERED':
+                return 'DELIVERED'
+            if obj.status in ('SHIPPED', 'OUT_FOR_DELIVERY') or shipment.courier_status.lower() in ('in transit', 'shipped', 'picked up', 'out for delivery', 'at hub'):
+                return 'IN_TRANSIT'
+            return 'NCM_ORDER_CREATED'
+
+        if obj.ncm_dispatch_status == 'MANUAL_REVIEW_REQUIRED':
+            return 'MANUAL_REVIEW_REQUIRED'
+        if obj.ncm_dispatch_status == 'FAILED':
+            return 'DISPATCH_FAILED'
+        if obj.ncm_dispatch_status == 'CREATING':
+            return 'DISPATCH_PROCESSING'
+        if obj.ncm_dispatch_status == 'QUEUED':
+            return 'DISPATCH_QUEUED'
+
+        if obj.payment_status in ('PAID', 'PARTIALLY_PAID') and obj.status in ('CONFIRMED', 'PROCESSING'):
+            return 'PAYMENT_VERIFIED'
+
+        return 'PENDING_PAYMENT'
+
+    def get_dispatch_observability(self, obj) -> Dict[str, Any]:
+        """Provides complete administrative observability telemetry."""
+        shipment = getattr(obj, 'courier_shipment', None)
+        latest_job = getattr(obj, '_prefetched_objects_cache', {}).get('ncm_dispatch_jobs')
+        if latest_job is not None and len(latest_job) > 0:
+            job = latest_job[0]
+        else:
+            job = obj.ncm_dispatch_jobs.order_by('-created_at').first() if hasattr(obj, 'ncm_dispatch_jobs') else None
+
+        queue_ts = job.created_at.isoformat() if job else None
+        worker_ts = (
+            job.last_attempt_at.isoformat() if job and job.last_attempt_at else
+            obj.ncm_dispatch_last_attempt_at.isoformat() if obj.ncm_dispatch_last_attempt_at else None
+        )
+
+        from marketplace.models import NCMConfiguration
+        config = NCMConfiguration.get_settings()
+        ncm_auth_status = config.connection_status if config else 'untested'
+
+        return {
+            'lifecycle_status': self.get_lifecycle_status(obj),
+            'payment_verification_status': (
+                'Verified (15% Advance)' if obj.is_cod and obj.payment_status == 'PARTIALLY_PAID' else
+                'Verified (100% Full Payment)' if obj.payment_status == 'PAID' else
+                'Pending Verification'
+            ),
+            'dispatch_job_status': (
+                'COMPLETED' if shipment else
+                job.status if job else
+                obj.ncm_dispatch_status
+            ),
+            'queue_timestamp': queue_ts,
+            'worker_execution_timestamp': worker_ts,
+            'ncm_auth_status': ncm_auth_status,
+            'dispatch_attempt_count': obj.ncm_dispatch_attempts or (job.attempts if job else 0),
+            'ncm_order_id': shipment.ncm_order_id if shipment else None,
+            'tracking_reference': shipment.tracking_id if shipment else None,
+            'last_failure_reason': obj.ncm_dispatch_last_error or (job.last_error if job else ''),
+            'next_retry_status': (
+                obj.ncm_dispatch_next_retry.isoformat() if obj.ncm_dispatch_next_retry else
+                'Manual review required' if obj.ncm_dispatch_status == 'MANUAL_REVIEW_REQUIRED' else
+                'None scheduled'
+            ),
+        }
 
 class DeliveryFeeRuleSerializer(serializers.ModelSerializer):
 
@@ -1056,6 +1136,9 @@ class NCMConfigurationSerializer(serializers.ModelSerializer):
             'last_connection_error',
             'last_sync_at',
             'last_sync_status',
+            'branch_sync_source',
+            'last_branch_sync_at',
+            'branch_record_count',
             'last_webhook_received_at',
             'last_webhook_event',
             'last_webhook_error',
@@ -1074,6 +1157,9 @@ class NCMConfigurationSerializer(serializers.ModelSerializer):
             'last_connection_error',
             'last_sync_at',
             'last_sync_status',
+            'branch_sync_source',
+            'last_branch_sync_at',
+            'branch_record_count',
             'last_webhook_received_at',
             'last_webhook_event',
             'last_webhook_error',
