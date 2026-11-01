@@ -13,8 +13,9 @@ Security & Reliability Guarantees:
 - Shipment creation (POST /v1/order/create) is NEVER automatically retried on ambiguous timeouts.
 """
 
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 import logging
+import os
 import re
 import time
 import requests
