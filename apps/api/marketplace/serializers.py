@@ -750,8 +750,8 @@ class OrderSerializer(serializers.ModelSerializer):
         """Provides complete administrative observability telemetry."""
         shipment = getattr(obj, 'courier_shipment', None)
         latest_job = getattr(obj, '_prefetched_objects_cache', {}).get('ncm_dispatch_jobs')
-        if latest_job is not None and len(latest_job) > 0:
-            job = latest_job[0]
+        if latest_job is not None:
+            job = latest_job[0] if len(latest_job) > 0 else None
         else:
             job = obj.ncm_dispatch_jobs.order_by('-created_at').first() if hasattr(obj, 'ncm_dispatch_jobs') else None
 
@@ -761,9 +761,14 @@ class OrderSerializer(serializers.ModelSerializer):
             obj.ncm_dispatch_last_attempt_at.isoformat() if obj.ncm_dispatch_last_attempt_at else None
         )
 
-        from marketplace.models import NCMConfiguration
-        config = NCMConfiguration.get_settings()
-        ncm_auth_status = config.connection_status if config else 'untested'
+        ncm_auth_status = self.context.get('ncm_auth_status') if isinstance(self.context, dict) else None
+        if ncm_auth_status is None:
+            ncm_auth_status = getattr(self, '_cached_ncm_auth_status', None)
+        if ncm_auth_status is None:
+            from marketplace.models import NCMConfiguration
+            config = NCMConfiguration.get_settings()
+            ncm_auth_status = config.connection_status if config else 'untested'
+            self._cached_ncm_auth_status = ncm_auth_status
 
         return {
             'lifecycle_status': self.get_lifecycle_status(obj),

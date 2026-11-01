@@ -146,8 +146,9 @@ export default function MarketplaceOrdersPage() {
     try {
       const data = await marketplaceApi.adminGetOrders();
       setOrders(Array.isArray(data) ? data : ((data as any)?.results || []));
-    } catch (error) {
+    } catch (error: any) {
       console.error("Failed to fetch orders:", error);
+      toast.error(error?.data?.detail || error?.message || "Failed to fetch orders.");
     } finally {
       setLoading(false);
     }

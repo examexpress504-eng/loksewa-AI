@@ -775,21 +775,6 @@ class NCMService:
 
                 # Check for HTTP errors
                 if response.status_code >= 400:
-                    # If public endpoint (e.g. branches) gets 401 due to invalid token, retry without Authorization header
-                    if response.status_code == 401 and "branches" in endpoint:
-                        logger.info("NCM token rejected on branches endpoint. Retrying with public headers without token.")
-                        headers_public = {k: v for k, v in headers.items() if k.lower() != "authorization"}
-                        response_pub = self._session.request(
-                            method=method_upper,
-                            url=url,
-                            headers=headers_public,
-                            params=params,
-                            json=json_data,
-                            timeout=self.timeout,
-                        )
-                        if response_pub.status_code < 400:
-                            return response_pub
-
                     # Do not retry 4xx client errors
                     if 400 <= response.status_code < 500:
                         logger.warning(
@@ -977,8 +962,8 @@ class NCMService:
             except Exception as e:
                 logger.warning("Cache access error during NCM get_branches: %s", e)
 
-        if not self.base_url and not self.is_configured():
-            logger.info("NCM API base URL not configured; serving verified local branch catalog.")
+        if not self.is_configured():
+            logger.info("NCM API credentials not configured; serving verified local branch catalog.")
             branches, source = self._get_fallback_or_seeded_branches_with_source()
             meta = {
                 "source": source,
@@ -1120,20 +1105,11 @@ class NCMService:
         """
         Synchronizes branch records from NCM API into persistent NCMBranchRecord models.
         Preserves admin-verified coordinates without overwriting them.
-        Optimized with in-memory map and bulk operations for sub-second database synchronization.
+        Guarantees zero duplicate records.
         """
         synced_count = 0
         try:
             from .models import NCMBranchRecord
-            from django.db import transaction
-
-            existing_records = {r.code.strip(): r for r in NCMBranchRecord.objects.all() if r.code}
-            existing_names = {r.name.strip().lower(): r for r in existing_records.values() if r.name}
-
-            to_create = []
-            to_update = []
-            now = timezone.now()
-
             for b in branches:
                 name = str(b.get("name") or "").strip()
                 if not name:
@@ -1152,33 +1128,26 @@ class NCMService:
 
                 b_lat = b.get("latitude")
                 b_lon = b.get("longitude")
-                # Parse geocode string e.g. "28.066032, 83.247817"
-                geocode = b.get("geocode")
-                if b_lat is None and geocode and isinstance(geocode, str) and "," in geocode:
-                    try:
-                        pts = geocode.split(",")
-                        b_lat = float(pts[0].strip())
-                        b_lon = float(pts[1].strip())
-                    except (ValueError, IndexError):
-                        pass
-
-                b_src = b.get("coordinate_source") or ("API" if b_lat is not None else "UNVERIFIED")
+                b_src = b.get("coordinate_source")
                 b_ver = bool(b.get("is_coordinate_verified", False))
 
-                rec = existing_records.get(code) or existing_names.get(name.lower())
+                # Check by code first, then by name to avoid duplicate records
+                rec = NCMBranchRecord.objects.filter(code=code).first()
+                if not rec:
+                    rec = NCMBranchRecord.objects.filter(name__iexact=name).first()
+
                 if not rec:
                     if b_lat is not None and b_lon is not None:
                         c_lat, c_lon = b_lat, b_lon
-                        coord_src = b_src
+                        coord_src = b_src or 'API'
                         is_ver = b_ver
                     else:
                         c_lat, c_lon, c_src, _ = get_municipality_centroid(mun or name, dist, prov)
-                        coord_src = "UNVERIFIED"
+                        coord_src = 'UNVERIFIED'
                         is_ver = False
                         if c_lat is not None:
-                            coord_src = "MUNICIPALITY_CENTROID" if c_src == "municipality_centroid" else "DISTRICT_CENTROID"
-
-                    to_create.append(NCMBranchRecord(
+                            coord_src = 'MUNICIPALITY_CENTROID' if c_src == 'municipality_centroid' else 'DISTRICT_CENTROID'
+                    NCMBranchRecord.objects.create(
                         code=code,
                         name=name,
                         district_name=dist,
@@ -1191,10 +1160,10 @@ class NCMService:
                         longitude=c_lon,
                         coordinate_source=coord_src,
                         is_coordinate_verified=is_ver,
-                        is_serviceable=bool(b.get("is_serviceable", True)),
-                        is_active=True,
-                        last_synced_at=now,
-                    ))
+                        is_serviceable=bool(b.get('is_serviceable', True)),
+                        last_synced_at=timezone.now(),
+                    )
+                    synced_count += 1
                 else:
                     rec.code = code
                     rec.name = name
@@ -1205,36 +1174,25 @@ class NCMService:
                     rec.contact_number = contact or rec.contact_number
                     if raw_cov:
                         rec.areas_covered = raw_cov
-                    if "is_serviceable" in b:
-                        rec.is_serviceable = bool(b["is_serviceable"])
-                    rec.is_active = True
-                    rec.last_synced_at = now
+                    if 'is_serviceable' in b:
+                        rec.is_serviceable = bool(b['is_serviceable'])
+                    rec.last_synced_at = timezone.now()
 
-                    if not rec.is_coordinate_verified and rec.coordinate_source != "ADMIN_VERIFIED":
+                    # Preserve admin-verified coordinates
+                    if not rec.is_coordinate_verified and rec.coordinate_source != 'ADMIN_VERIFIED':
                         if b_lat is not None and b_lon is not None:
                             rec.latitude = b_lat
                             rec.longitude = b_lon
-                            rec.coordinate_source = b_src
+                            rec.coordinate_source = b_src or 'API'
                             rec.is_coordinate_verified = b_ver
                         elif not rec.has_valid_coordinates:
                             c_lat, c_lon, c_src, _ = get_municipality_centroid(mun or name, dist, prov)
                             if c_lat is not None:
                                 rec.latitude = c_lat
                                 rec.longitude = c_lon
-                                rec.coordinate_source = "MUNICIPALITY_CENTROID" if c_src == "municipality_centroid" else "DISTRICT_CENTROID"
-                    to_update.append(rec)
-
-            with transaction.atomic():
-                if to_create:
-                    NCMBranchRecord.objects.bulk_create(to_create, batch_size=250)
-                if to_update:
-                    NCMBranchRecord.objects.bulk_update(
-                        to_update,
-                        fields=["code", "name", "district_name", "province_name", "municipality", "address", "contact_number", "areas_covered", "latitude", "longitude", "coordinate_source", "is_coordinate_verified", "is_serviceable", "is_active", "last_synced_at"],
-                        batch_size=250
-                    )
-            synced_count = len(to_create) + len(to_update)
-            logger.info("Successfully synced %d branches (%d created, %d updated)", synced_count, len(to_create), len(to_update))
+                                rec.coordinate_source = 'MUNICIPALITY_CENTROID' if c_src == 'municipality_centroid' else 'DISTRICT_CENTROID'
+                    rec.save()
+                    synced_count += 1
         except Exception as e:
             logger.warning("Failed to synchronize NCM branches to DB: %s", e)
         return synced_count

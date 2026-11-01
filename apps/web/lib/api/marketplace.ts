@@ -1250,10 +1250,10 @@ export const marketplaceApi = {
 
   // Admin - Orders
   adminGetOrders: async () => {
-    return apiClient<Order[]>("/marketplace/admin/orders/");
+    return apiClient<Order[]>("/marketplace/admin/orders/", { timeoutMs: 60000 });
   },
   adminGetOrder: async (id: number) => {
-    return apiClient<Order>(`/marketplace/admin/orders/${id}/`);
+    return apiClient<Order>(`/marketplace/admin/orders/${id}/`, { timeoutMs: 60000 });
   },
   adminUpdateOrderStatus: async (id: number, status: string, note?: string) => {
     return apiClient<Order>(`/marketplace/admin/orders/${id}/update_status/`, {

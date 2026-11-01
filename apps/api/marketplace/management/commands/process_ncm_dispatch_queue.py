@@ -26,3 +26,4 @@ class Command(BaseCommand):
                 f"{res.get('succeeded', 0)} succeeded, {res.get('failed', 0)} failed."
             )
         )
+

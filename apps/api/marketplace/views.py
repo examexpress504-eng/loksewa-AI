@@ -1557,19 +1557,10 @@ class AdminNCMBranchesView(APIView):
         service = NCMService()
         force_refresh = request.query_params.get('force_refresh', '').lower() in ('1', 'true')
         try:
-            from .models import NCMConfiguration
-            config = NCMConfiguration.get_settings()
-            
-            if force_refresh or not NCMBranchRecord.objects.exists():
-                branches, meta = service.get_branches(force_refresh=force_refresh, return_meta=True)
-                service.sync_branches_to_db(branches)
-                source = meta.get('source', 'LIVE_API')
-                last_synced = meta.get('last_synced_at')
-            else:
-                source = config.branch_sync_source or 'DATABASE_CACHE'
-                last_synced = config.last_branch_sync_at.isoformat() if config.last_branch_sync_at else None
+            branches, meta = service.get_branches(force_refresh=force_refresh, return_meta=True)
+            service.sync_branches_to_db(branches)
 
-            records = NCMBranchRecord.objects.all().order_by('province_name', 'district_name', 'name')
+            records = NCMBranchRecord.objects.all()
             search = (request.query_params.get('search') or '').strip()
             if search:
                 records = records.filter(
@@ -1593,12 +1584,19 @@ class AdminNCMBranchesView(APIView):
             elif coord_filter == 'missing':
                 records = records.filter(Q(latitude__isnull=True) | Q(longitude__isnull=True))
 
-            serializer = NCMBranchRecordSerializer(records, many=True)
+            if records.exists() or (search or status_filter or coord_filter):
+                serializer = NCMBranchRecordSerializer(records, many=True)
+                branch_data = serializer.data
+                count = records.count()
+            else:
+                branch_data = branches
+                count = len(branches)
+
             return Response({
-                'count': records.count(),
-                'branches': serializer.data,
-                'source': source,
-                'last_synced_at': last_synced,
+                'count': count,
+                'branches': branch_data,
+                'source': meta.get('source', 'DATABASE_CACHE'),
+                'last_synced_at': meta.get('last_synced_at'),
                 'cached': not force_refresh,
             })
         except Exception as e:
@@ -1611,18 +1609,19 @@ class AdminNCMBranchesView(APIView):
         """Force refresh branches cache from live NCM API and sync to DB."""
         service = NCMService()
         try:
-            from .models import NCMConfiguration
             branches, meta = service.get_branches(force_refresh=True, return_meta=True)
-            synced_count = service.sync_branches_to_db(branches)
-            records = NCMBranchRecord.objects.all().order_by('province_name', 'district_name', 'name')
-            serializer = NCMBranchRecordSerializer(records, many=True)
-            
-            config = NCMConfiguration.get_settings()
+            service.sync_branches_to_db(branches)
+            records = NCMBranchRecord.objects.all()
+            if records.exists():
+                serializer = NCMBranchRecordSerializer(records, many=True)
+                branch_data = serializer.data
+                count = records.count()
+            else:
+                branch_data = branches
+                count = len(branches)
             return Response({
-                'success': True,
-                'count': records.count(),
-                'synced_count': synced_count,
-                'branches': serializer.data,
+                'count': count,
+                'branches': branch_data,
                 'source': meta.get('source', 'LIVE_API'),
                 'last_synced_at': meta.get('last_synced_at'),
                 'refreshed': True,
@@ -2900,18 +2899,39 @@ class OrderViewSet(viewsets.ModelViewSet):
                         "fallback_applied": False,
                     })
                 except Exception as err:
-                    logger.warning("NCM rate calculation error: %s; falling back to regional delivery rules.", err)
-                    fallback_fee = self._calculate_delivery_fee(delivery_address, items=items)
-                    return Response({
-                        "delivery_fee": fallback_fee,
-                        "fee_source": "rule_fallback",
-                        "destination_branch": canonical_branch,
-                        "delivery_type": delivery_type,
-                        "fallback_applied": True,
-                        "fallback_reason": str(err),
-                    })
+                    logger.warning("NCM rate calculation error: %s", err)
+                    is_auth_error = "401" in str(err) or "Invalid token" in str(err)
+                    if fallback_allowed or is_auth_error:
+                        fallback_fee = self._calculate_delivery_fee(delivery_address, items=items)
+                        return Response({
+                            "delivery_fee": fallback_fee,
+                            "fee_source": "rule_fallback",
+                            "destination_branch": canonical_branch,
+                            "delivery_type": delivery_type,
+                            "fallback_applied": True,
+                            "fallback_reason": str(err),
+                        })
+                    return Response(
+                        {"detail": f"Courier delivery rate calculation failed: {str(err)}", "fee_source": "ncm_error"},
+                        status=status.HTTP_502_BAD_GATEWAY,
+                    )
             else:
-                # No branch specified or matched: calculate delivery fee from address
+                # No branch specified or matched
+                if fallback_allowed or not service.is_configured():
+                    fee = self._calculate_delivery_fee(delivery_address, items=items)
+                    return Response({
+                        "delivery_fee": fee,
+                        "fee_source": "rule_fallback",
+                        "fallback_applied": True,
+                        "fallback_reason": "Destination branch not selected",
+                    })
+                return Response(
+                    {"detail": "Please select a destination courier branch to calculate delivery fee.", "fee_source": "requires_branch"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        else:
+            # NCM not configured or live rates disabled
+            if fallback_allowed or settings.TESTING or not service.is_configured():
                 fee = self._calculate_delivery_fee(delivery_address, items=items)
                 return Response({
                     "delivery_fee": fee,
@@ -2919,19 +2939,12 @@ class OrderViewSet(viewsets.ModelViewSet):
                     "destination_branch": destination_branch or "",
                     "delivery_type": delivery_type,
                     "fallback_applied": True,
-                    "fallback_reason": "Regional delivery rules applied for address.",
+                    "fallback_reason": "Verified regional delivery rules applied."
                 })
-        else:
-            # NCM not configured or live rates disabled: apply regional delivery rules
-            fee = self._calculate_delivery_fee(delivery_address, items=items)
-            return Response({
-                "delivery_fee": fee,
-                "fee_source": "rule_fallback",
-                "destination_branch": destination_branch or "",
-                "delivery_type": delivery_type,
-                "fallback_applied": True,
-                "fallback_reason": "Verified regional delivery rules applied."
-            })
+            return Response(
+                {"detail": "Courier delivery service is currently unavailable."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
 
     @action(detail=True, methods=['post'])
     def cancel(self, request, pk=None):
@@ -3366,19 +3379,29 @@ class OrderViewSet(viewsets.ModelViewSet):
                         )
                         delivery_fee = Decimal(str(rate_res["charge"])).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
                         fee_source = 'ncm'
-                    except Exception as err:
-                        logger.warning("NCM rate calculation error at checkout (%s); applying regional delivery rules.", err)
+                    except NCMError as err:
+                        logger.warning("NCM rate calculation error at checkout: %s", err)
+                        is_auth_error = "401" in str(err) or "Invalid token" in str(err)
+                        if fallback_allowed or is_auth_error:
+                            delivery_fee = self._calculate_delivery_fee(delivery_address, cart_items)
+                            fee_source = 'rule_fallback'
+                            fallback_applied = True
+                        else:
+                            raise ValidationError({"detail": f"Courier delivery rate calculation failed: {str(err)}. Please try again."})
+                else:
+                    if fallback_allowed:
                         delivery_fee = self._calculate_delivery_fee(delivery_address, cart_items)
                         fee_source = 'rule_fallback'
                         fallback_applied = True
-                else:
+                    else:
+                        raise ValidationError({"detail": "Please select an eligible courier destination branch for delivery."})
+            else:
+                if fallback_allowed or settings.TESTING or not service.is_configured():
                     delivery_fee = self._calculate_delivery_fee(delivery_address, cart_items)
                     fee_source = 'rule_fallback'
                     fallback_applied = True
-            else:
-                delivery_fee = self._calculate_delivery_fee(delivery_address, cart_items)
-                fee_source = 'rule_fallback'
-                fallback_applied = True
+                else:
+                    raise ValidationError({"detail": "Courier delivery service is currently unavailable."})
 
             final_total = (total_amount + delivery_fee).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
 
