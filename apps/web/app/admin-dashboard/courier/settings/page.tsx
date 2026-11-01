@@ -428,7 +428,7 @@ export default function CourierSettingsPage() {
                 />
               </div>
 
-              {config?.token_source === "DATABASE" && (
+              {(config?.token_source === "DATABASE" || config?.token_source === "database") && (
                 <div className="flex items-center justify-between pt-1">
                   <span className="text-[11px] text-amber-700 font-medium">
                     Token is currently overridden in the database.

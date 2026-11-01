@@ -352,9 +352,10 @@ export interface NCMConfiguration {
   custom_base_url: string;
   effective_base_url: string;
   masked_token: string;
-  token_source: "database" | "environment" | "not_configured";
+  token_source: "database" | "environment" | "not_configured" | "DATABASE" | "ENVIRONMENT" | "NOT_CONFIGURED";
   has_token: boolean;
   new_api_token?: string;
+  clear_database_token?: boolean;
   default_origin_branch: string;
   live_rates_enabled: boolean;
   fallback_rules_enabled: boolean;
